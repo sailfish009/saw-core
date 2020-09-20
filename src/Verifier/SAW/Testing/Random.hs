@@ -1,5 +1,6 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE DoAndIfThenElse #-}
+{-# LANGUAGE OverloadedStrings #-}
 -- |
 -- Module      :  Verifier.SAW.Testing.Random
 -- Copyright   :  (c) 2013-2015 Galois, Inc.
@@ -16,8 +17,7 @@ module Verifier.SAW.Testing.Random where
 
 import Verifier.SAW.FiniteValue
   (asFiniteTypePure, scFiniteValue, FiniteType(..), FiniteValue(..))
-import Verifier.SAW.Prim (Nat(..))
-import Verifier.SAW.Recognizer (asBoolType, asPi)
+import Verifier.SAW.Recognizer (asBoolType, asPi, asEq)
 import Verifier.SAW.SharedTerm
   (scApplyAll, scGetModuleMap, scWhnf, SharedContext, Term)
 import Verifier.SAW.Simulator.Concrete (evalSharedTerm, CValue)
@@ -29,11 +29,10 @@ import Verifier.SAW.Utils (panic)
 import Control.Applicative ((<$>), Applicative)
 import Data.Traversable (traverse)
 #endif
-import Control.Monad (msum, replicateM)
-import Control.Monad.IO.Class (liftIO, MonadIO)
 import Control.Monad.Random
 import Data.Map (Map)
 import qualified Data.Map as Map
+import Numeric.Natural (Natural)
 import System.Random.TF (newTFGen, TFGen)
 
 ----------------------------------------------------------------
@@ -79,6 +78,8 @@ scRunTest sc fun gens = do
     VBool True -> return $ Nothing
     VBool False -> do
       return $ Just xs
+    VDataType "Prelude.Eq" [VBoolType, VBool x, VBool y] -> do
+      return $ if x == y then Nothing else Just xs
     _ -> panic "Type error while running test"
          [ "Expected a boolean, but got:"
          , show result ]
@@ -94,6 +95,8 @@ scRunTest sc fun gens = do
 -- arguments. The supported function types are of the form
 --
 --   'FiniteType -> ... -> FiniteType -> Bool'
+--   or
+--   'FiniteType -> ... -> FiniteType -> Eq (...) (...)'
 --
 -- and 'Nothing' is returned when attempting to generate arguments for
 -- functions of unsupported type.
@@ -107,6 +110,7 @@ scTestableType sc ty = do
       rngGens <- scTestableType sc rng
       return $ (domGen :) <$> rngGens
     (asBoolType -> Just ()) -> return $ Just []
+    (asEq -> Just _) -> return $ Just []
     _ -> return Nothing
 
 ----------------------------------------------------------------
@@ -130,16 +134,16 @@ randomBit :: (Functor m, MonadRandom m) => m FiniteValue
 randomBit = FVBit <$> getRandom
 
 -- | Generate a random word of the given length (i.e., a value of type @[w]@)
-randomWord :: (Functor m, MonadRandom m) => Nat -> m FiniteValue
-randomWord w = FVWord w <$> getRandomR (0, 2^(unNat w) - 1)
+randomWord :: (Functor m, MonadRandom m) => Natural -> m FiniteValue
+randomWord w = FVWord w <$> getRandomR (0, 2^w - 1)
 
 {- | Generate a random vector.  Generally, this should be used for sequences
 other than bits.  For sequences of bits use "randomWord".  The difference
 is mostly about how the results will be displayed. -}
 randomVec :: (Applicative m, Functor m, MonadRandom m) =>
-  Nat -> FiniteType -> m FiniteValue
+  Natural -> FiniteType -> m FiniteValue
 randomVec w t =
-  FVVec t <$> replicateM (fromIntegral . unNat $ w) (randomFiniteValue t)
+  FVVec t <$> replicateM (fromIntegral w) (randomFiniteValue t)
 
 -- | Generate a random tuple value.
 randomTuple :: (Applicative m, Functor m, MonadRandom m) =>
@@ -153,5 +157,5 @@ randomRec fieldTys = FVRec <$> traverse randomFiniteValue fieldTys
 
 _test :: IO ()
 _test = do
-  s <- evalRandIO $ randomFiniteValue (FTVec (Nat 16) (FTVec (Nat 1) FTBit))
+  s <- evalRandIO $ randomFiniteValue (FTVec 16 (FTVec 1 FTBit))
   print s

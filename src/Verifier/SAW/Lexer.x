@@ -37,6 +37,7 @@ import Control.Monad.State.Strict
 import qualified Data.ByteString.Lazy as B
 import Data.ByteString.Lazy.UTF8 (toString)
 import Data.Word (Word8)
+import Numeric.Natural
 
 import Verifier.SAW.Position
 
@@ -67,10 +68,10 @@ $cntrl     = [$large \@\[\\\]\^\_]
 $idchar    = [a-z A-Z 0-9 \' \_]
 @ident     = [a-z A-Z \_] $idchar*
 
-@punct = "#" | "," | "->" | "." | ".." | ";" | "::" | "=" | "?" | "??" | "???"
+@punct = "#" | "," | "->" | "." | ";" | ":" | "=" | "*"
        | "\" | "(" | ")" | "[" | "]" | "{" | "}" | "|"
-@keywords = "as" | "data" | "hiding" | "import" | "in" | "let" | "module"
-          | "qualified" | "sort" | "Prop" | "where" | "primitive" | "axiom"
+@keywords = "data" | "hiding" | "import" | "module"
+          | "sort" | "Prop" | "where" | "primitive" | "axiom"
 @key = @punct | @keywords
 
 @escape      = \\ ($charesc | @ascii | @decimal | o @octal | x @hex)
@@ -94,7 +95,7 @@ $white+;
 data Token
   = TIdent { tokIdent :: String }   -- ^ Identifier
   | TRecursor { tokRecursor :: String }   -- ^ Recursor
-  | TNat { tokNat :: Integer }  -- ^ Natural number literal
+  | TNat { tokNat :: Natural }  -- ^ Natural number literal
   | TString { tokString :: String } -- ^ String literal
   | TKey String     -- ^ Keyword or predefined symbol
   | TEnd            -- ^ End of file.

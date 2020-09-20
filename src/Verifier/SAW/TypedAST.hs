@@ -48,8 +48,6 @@ module Verifier.SAW.TypedAST
  , CtorArg(..)
  , Def(..)
  , DefQualifier(..)
- , patBoundVarCount
- , patUnusedVarCount
    -- * Terms and associated operations.
  , incVarsSimpleTerm
  , piArgCount
@@ -69,7 +67,7 @@ module Verifier.SAW.TypedAST
  , scPrettyTermInCtx
    -- * Primitive types.
  , Sort, mkSort, propSort, sortOf, maxSort
- , Ident(identModule, identName), mkIdent
+ , Ident(..), identName, mkIdent
  , parseIdent
  , isIdent
  , DeBruijnIndex

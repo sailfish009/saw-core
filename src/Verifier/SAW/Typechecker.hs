@@ -150,7 +150,7 @@ instance TypeInfer Un.Term where
                        ++ "type = " ++ show (typedType res))
        return res
 
--- | Main workhore function for type inference on untyped terms
+-- | Main workhorse function for type inference on untyped terms
 typeInferCompleteTerm :: Un.Term -> TCM TypedTerm
 
 -- Names
@@ -208,7 +208,12 @@ typeInferCompleteTerm (Un.Lambda p ((Un.termVarString -> x,tp):ctx) t) =
 typeInferCompleteTerm (Un.Pi _ [] t) = typeInferComplete t
 typeInferCompleteTerm (Un.Pi p ((Un.termVarString -> x,tp):ctx) t) =
   do tp_trm <- typeInferComplete tp
-     body <- withVar x (typedVal tp_trm) $
+     -- NOTE: we need the type of x to be normalized when we add it to the
+     -- context in withVar, but we do not want to normalize this type in the
+     -- output, as the contract for typeInferComplete only normalizes the type,
+     -- so we use the unnormalized tp_trm in the return
+     tp_whnf <- typeCheckWHNF $ typedVal tp_trm
+     body <- withVar x tp_whnf $
        typeInferComplete $ Un.Pi p ctx t
      typeInferComplete (Pi x tp_trm body)
 
@@ -224,16 +229,22 @@ typeInferCompleteTerm (Un.RecordType _ elems) =
 typeInferCompleteTerm (Un.RecordProj t prj) =
   (RecordProj <$> typeInferComplete t <*> return prj) >>= typeInferComplete
 
--- Old-style pairs
-typeInferCompleteTerm (Un.OldPairValue _ t1 t2) =
+-- Unit
+typeInferCompleteTerm (Un.UnitValue _) =
+  typeInferComplete (UnitValue :: FlatTermF TypedTerm)
+typeInferCompleteTerm (Un.UnitType _) =
+  typeInferComplete (UnitType :: FlatTermF TypedTerm)
+
+-- Simple pairs
+typeInferCompleteTerm (Un.PairValue _ t1 t2) =
   (PairValue <$> typeInferComplete t1 <*> typeInferComplete t2)
   >>= typeInferComplete
-typeInferCompleteTerm (Un.OldPairType _ t1 t2) =
+typeInferCompleteTerm (Un.PairType _ t1 t2) =
   (PairType <$> typeInferComplete t1 <*> typeInferComplete t2)
   >>= typeInferComplete
-typeInferCompleteTerm (Un.OldPairLeft t) =
+typeInferCompleteTerm (Un.PairLeft t) =
   (PairLeft <$> typeInferComplete t) >>= typeInferComplete
-typeInferCompleteTerm (Un.OldPairRight t) =
+typeInferCompleteTerm (Un.PairRight t) =
   (PairRight <$> typeInferComplete t) >>= typeInferComplete
 
 -- Type ascriptions
@@ -277,6 +288,9 @@ instance TypeInferCtx Un.TermVar Un.Term where
 -- | Type-check a list of declarations and insert them into the current module
 processDecls :: [Un.Decl] -> TCM ()
 processDecls [] = return ()
+processDecls (Un.TypedDef nm params rty body : rest) =
+  processDecls (Un.TypeDecl NoQualifier nm (Un.Pi (pos nm) params rty) :
+                Un.TermDef nm (map fst params) body : rest)
 processDecls (Un.TypeDecl NoQualifier (PosPair p nm) tp :
               Un.TermDef (PosPair _ ((== nm) -> True)) vars body : rest) =
   -- Type-checking for definitions
@@ -285,13 +299,14 @@ processDecls (Un.TypeDecl NoQualifier (PosPair p nm) tp :
      -- Step 1: type-check the type annotation, and make sure it is a type
      typed_tp <- typeInferComplete tp
      void $ ensureSort $ typedType typed_tp
-     def_tp <- liftTCM scTypeCheckWHNF (typedVal typed_tp)
+     let def_tp = typedVal typed_tp
+     def_tp_whnf <- liftTCM scTypeCheckWHNF def_tp
 
      -- Step 2: assign types to the bound variables of the definition, by
      -- peeling off the pi-abstraction variables in the type annotation. Any
      -- remaining body of the pi-type is the required type for the def body.
      (ctx, req_body_tp) <-
-       case matchPiWithNames (map Un.termVarString vars) def_tp of
+       case matchPiWithNames (map Un.termVarString vars) def_tp_whnf of
          Just x -> return x
          Nothing ->
              throwTCError $

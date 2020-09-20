@@ -22,11 +22,13 @@ module Verifier.SAW.Grammar
 
 import Control.Applicative ((<$>))
 import Control.Monad ()
-import Control.Monad.State (State, get, gets, modify, runState)
+import Control.Monad.State (State, get, gets, modify, put, runState, evalState)
+import Control.Monad.Except (ExceptT, throwError, runExceptT)
 import qualified Data.ByteString.Lazy.UTF8 as B
 import Data.Maybe (isJust)
 import Data.Traversable
 import Data.Word
+import Numeric.Natural
 import System.Directory (getCurrentDirectory)
 
 import Prelude hiding (mapM, sequence)
@@ -52,13 +54,9 @@ import Verifier.SAW.Lexer
   '='     { PosPair _ (TKey "=") }
   '\\'    { PosPair _ (TKey "\\") }
   ';'     { PosPair _ (TKey ";") }
-  '::'    { PosPair _ (TKey "::") }
+  ':'     { PosPair _ (TKey ":") }
   ','     { PosPair _ (TKey ",") }
   '.'     { PosPair _ (TKey ".") }
-  '..'    { PosPair _ (TKey "..") }
-  '?'     { PosPair _ (TKey "?") }
-  '??'    { PosPair _ (TKey "??") }
-  '???'   { PosPair _ (TKey "???") }
   '('     { PosPair _ (TKey "(") }
   ')'     { PosPair _ (TKey ")") }
   '['     { PosPair _ (TKey "[") }
@@ -66,14 +64,11 @@ import Verifier.SAW.Lexer
   '{'     { PosPair _ (TKey "{") }
   '}'     { PosPair _ (TKey "}") }
   '|'     { PosPair _ (TKey "|") }
-  'as'        { PosPair _ (TKey "as") }
+  '*'     { PosPair _ (TKey "*") }
   'data'      { PosPair _ (TKey "data") }
   'hiding'    { PosPair _ (TKey "hiding") }
   'import'    { PosPair _ (TKey "import") }
-  'in'        { PosPair _ (TKey "in") }
-  'let'       { PosPair _ (TKey "let") }
   'module'    { PosPair _ (TKey "module") }
-  'qualified' { PosPair _ (TKey "qualified") }
   'sort'      { PosPair _ (TKey "sort") }
   'Prop'      { PosPair _ (TKey "Prop") }
   'where'     { PosPair _ (TKey "where") }
@@ -98,14 +93,19 @@ Import : 'import' ModuleName opt(ModuleImports) ';'
           { Import $2 $3 }
 
 SAWDecl :: { Decl }
-SAWDecl : 'data' Ident VarCtx '::' LTerm 'where' '{' list(CtorDecl) '}'
+SAWDecl : 'data' Ident VarCtx ':' LTerm 'where' '{' list(CtorDecl) '}'
              { DataDecl $2 $3 $5 $8 }
-        | 'primitive' Ident '::' LTerm ';'
+        | 'primitive' Ident ':' LTerm ';'
              { TypeDecl PrimQualifier $2 $4 }
-        | 'axiom' Ident '::' LTerm ';'
+        | 'axiom' Ident ':' LTerm ';'
              { TypeDecl AxiomQualifier $2 $4 }
-        | Ident '::' LTerm ';' { TypeDecl NoQualifier $1 $3 }
+        | Ident ':' LTerm opt(DefBody) ';' { maybe (TypeDecl NoQualifier $1 $3)
+                                                   (TypedDef $1 [] $3) $4 }
         | Ident list(TermVar) '=' LTerm ';' { TermDef $1 $2 $4 }
+        | Ident VarCtxItem VarCtx ':' LTerm '=' LTerm ';' { TypedDef $1 ($2 ++ $3) $5 $7 }
+
+DefBody :: { Term }
+DefBody : '=' LTerm { $2 }
 
 ModuleImports :: { ImportConstraint }
 ModuleImports : 'hiding' ImportNames { HidingImports $2 }
@@ -128,7 +128,7 @@ DefVarCtx : list(DefVarCtxItem) { concat $1 }
 
 DefVarCtxItem :: { [(TermVar, Maybe Term)] }
 DefVarCtxItem : TermVar { [($1, Nothing)] }
-              | '(' list(TermVar) '::'  LTerm ')'
+              | '(' list(TermVar) ':'  LTerm ')'
                 { map (\var -> (var, Just $4)) $2 }
 
 -- A context of variables, all of which must be typed; i.e., a list syntactic
@@ -137,24 +137,30 @@ VarCtx :: { [(TermVar, Term)] }
 VarCtx : list(VarCtxItem) { concat $1 }
 
 VarCtxItem :: { [(TermVar, Term)] }
-VarCtxItem : '(' list(TermVar) '::' LTerm ')' { map (\var -> (var,$4)) $2 }
+VarCtxItem : '(' list(TermVar) ':' LTerm ')' { map (\var -> (var,$4)) $2 }
 
 -- Constructor declaration of the form "c (x1 x2 :: tp1) ... (z1 :: tpn) :: tp"
 CtorDecl :: { CtorDecl }
-CtorDecl : Ident VarCtx '::' LTerm ';' { Ctor $1 $2 $4 }
+CtorDecl : Ident VarCtx ':' LTerm ';' { Ctor $1 $2 $4 }
 
 Term :: { Term }
 Term : LTerm { $1 }
-     | LTerm '::' LTerm { TypeConstraint $1 (pos $2) $3 }
+     | LTerm ':' LTerm { TypeConstraint $1 (pos $2) $3 }
 
 -- Term with uses of pi and lambda, but no type ascriptions
 LTerm :: { Term }
-LTerm : AppTerm                          { $1 }
+LTerm : ProdTerm                         { $1 }
       | PiArg '->' LTerm                 { Pi (pos $2) $1 $3 }
       | '\\' VarCtx '->' LTerm           { Lambda (pos $1) $2 $4 }
 
 PiArg :: { [(TermVar, Term)] }
-PiArg : AppTerm { mkPiArg $1 }
+PiArg : ProdTerm { mkPiArg $1 }
+
+-- Term formed from infix product type operator (right-associative)
+ProdTerm :: { Term }
+ProdTerm
+  : AppTerm                        { $1 }
+  | AppTerm '*' ProdTerm           { PairType (pos $1) $1 $3 }
 
 -- Term formed from applications of atomic expressions
 AppTerm :: { Term }
@@ -172,16 +178,12 @@ AtomTerm
   | AtomTerm '.' Ident           { RecordProj $1 (val $3) }
   | AtomTerm '.' IdentRec        {% parseRecursorProj $1 $3 }
   | AtomTerm '.' nat             {% parseTupleSelector $1 (fmap tokNat $3) }
-  | '(' sepBy(Term, ',') ')'     { parseTuple (pos $1) $2 }
-  | '#' '(' sepBy(Term, ',') ')'       {% parseTupleType (pos $1) $3 }
+  | '(' sepBy(Term, ',') ')'     { mkTupleValue (pos $1) $2 }
+  | '#' '(' sepBy(Term, ',') ')'       { mkTupleType (pos $1) $3 }
   |     '[' sepBy(Term, ',') ']'       { VecLit (pos $1) $2 }
   |     '{' sepBy(FieldValue, ',') '}' { RecordValue (pos $1) $2 }
   | '#' '{' sepBy(FieldType, ',') '}'  { RecordType  (pos $1) $3 }
-
-    -- FIXME: old-style pairs, pair types, and pair projections
-  |     '(' Term '|' Term ')'          { OldPairValue (pos $1) $2 $4 }
-  | '#' '(' Term '|' Term ')'          { OldPairType (pos $1) $3 $5 }
-  | AtomTerm '.' '(' nat ')'           {% mkOldTupleProj $1 (tokNat (val $4)) }
+  | AtomTerm '.' '(' nat ')'           {% mkTupleProj $1 (tokNat (val $4)) }
 
 Ident :: { PosPair String }
 Ident : ident { fmap tokIdent $1 }
@@ -193,7 +195,7 @@ FieldValue :: { (PosPair String, Term) }
 FieldValue : Ident '=' Term { ($1, $3) }
 
 FieldType :: { (PosPair String, Term) }
-FieldType : Ident '::' LTerm { ($1, $3) }
+FieldType : Ident ':' LTerm { ($1, $3) }
 
 opt(q) :: { Maybe q }
   : { Nothing }
@@ -233,29 +235,21 @@ rlist1(p) :: { [p] }
 {
 data ParseError
   = UnexpectedLex [Word8]
-  | UnexpectedEndOfBlockComment
   | UnexpectedToken Token
   | ParseError String
-  | UnexpectedEnd
   deriving (Show)
 
-type ErrorList = [PosPair ParseError]
-
-data ParserState = PS { psInput :: AlexInput
-                      , psErrors :: [PosPair ParseError]
-                      }
-
-newtype Parser a = Parser { _unParser :: State ParserState a }
+newtype Parser a = Parser { _unParser :: ExceptT (PosPair ParseError) (State AlexInput) a }
   deriving (Applicative, Functor, Monad)
 
-addError :: Pos -> ParseError -> Parser ()
-addError p err = Parser $ modify $ \s -> s { psErrors = PosPair p err : psErrors s }
+addError :: Pos -> ParseError -> Parser a
+addError p err = Parser $ throwError (PosPair p err)
 
 setInput :: AlexInput -> Parser ()
-setInput inp = Parser $ modify $ \s -> s { psInput = inp }
+setInput inp = Parser $ put inp
 
 parsePos :: Parser Pos
-parsePos = Parser $ gets (pos . psInput)
+parsePos = Parser $ gets pos
 
 lexer :: (PosPair Token -> Parser a) -> Parser a
 lexer f = do
@@ -265,7 +259,7 @@ lexer f = do
                 Nothing -> return ()
                 Just (po,l) -> addError po (UnexpectedLex (reverse l))
         s <- Parser get
-        let inp@(PosPair p (Buffer _ b)) = psInput s
+        let inp@(PosPair p (Buffer _ b)) = s
             end = addErrors >> next (PosPair p TEnd)
         case alexScan inp 0 of
           AlexEOF -> end
@@ -296,40 +290,21 @@ lexer f = do
 
 -- | Run parser given a directory for the base (used for making pathname relative),
 -- bytestring to parse, and parser to run.
-runParser :: Parser a -> FilePath -> FilePath -> B.ByteString -> (a,ErrorList)
-runParser (Parser m) base path b = (r, reverse (psErrors s))
-  where initState = PS { psInput = initialAlexInput base path b, psErrors = [] }
-        (r,s) = runState m initState
+runParser :: Parser a -> FilePath -> FilePath -> B.ByteString -> Either (PosPair ParseError) a
+runParser (Parser m) base path b = evalState (runExceptT m) initState
+  where initState = initialAlexInput base path b
 
-parseSAW :: FilePath -> FilePath -> B.ByteString -> (Module,ErrorList)
+parseSAW :: FilePath -> FilePath -> B.ByteString -> Either (PosPair ParseError) Module
 parseSAW = runParser parseSAW2
 
-parseSAWTerm :: FilePath -> FilePath -> B.ByteString -> (Term,ErrorList)
+parseSAWTerm :: FilePath -> FilePath -> B.ByteString -> Either (PosPair ParseError) Term
 parseSAWTerm = runParser parseSAWTerm2
 
 parseError :: PosPair Token -> Parser a
-parseError pt = do
-  addError (pos pt) (UnexpectedToken (val pt))
-  fail $ (ppPos (pos pt)) ++ " Parse error\n  " ++ (ppToken (val pt))
+parseError pt = addError (pos pt) (UnexpectedToken (val pt))
 
 addParseError :: Pos -> String -> Parser ()
 addParseError p s = addError p (ParseError s)
-
-unexpectedIntLiteral :: Pos -> Integer -> String -> Parser ()
-unexpectedIntLiteral p _ ctxt = do
-  addParseError p $ "Unexpected integer literal when parsing " ++ ctxt ++ "."
-
-unexpectedTypeConstraint :: Pos -> Parser ()
-unexpectedTypeConstraint p = addParseError p "Unexpected type constraint."
-
-unexpectedPi :: Pos -> Parser ()
-unexpectedPi p = addParseError p "Unexpected pi expression"
-
-unexpectedLambda :: Pos -> Parser ()
-unexpectedLambda p = addParseError p "Unexpected lambda expression"
-
-unexpectedOpenParen :: Pos -> Parser ()
-unexpectedOpenParen p = addParseError p "Unexpected parenthesis"
 
 -- Try to parse an expression as a list of identifiers
 exprAsIdentList :: Term -> Maybe [TermVar]
@@ -340,7 +315,7 @@ exprAsIdentList _ = Nothing
 
 -- | Pi expressions should have one of the forms:
 --
--- * '(' list(Ident) '::' LTerm ')' '->' LTerm
+-- * '(' list(Ident) ':' LTerm ')' '->' LTerm
 -- * AppTerm '->' LTerm
 --
 -- This function takes in a term for the LHS and tests if it is of the first
@@ -351,26 +326,12 @@ mkPiArg (TypeConstraint (exprAsIdentList -> Just xs) _ t) =
   map (\x -> (x, t)) xs
 mkPiArg lhs = [(UnusedVar (pos lhs), lhs)]
 
--- | Parse a tuple value @(x1, .., xn)@ as a record value whose fields are named
--- @1@, @2@, etc. As a special case, the unary tuple @(x)@ is just @x@.
-parseTuple :: Pos -> [Term] -> Term
-parseTuple _ [t] = t
-parseTuple p ts = mkTupleValue p ts
-
--- | Parse a tuple type @#(x1, .., xn)@ as a record type whose fields are named
--- @1@, @2@, etc. As a special case, the unary tuple @(x)@ is just @x@.
-parseTupleType :: Pos -> [Term] -> Parser Term
-parseTupleType p [tp] =
-  addParseError p "Tuple type may not contain a single value." >>
-  return (badTerm p)
-parseTupleType p tps = return $ mkTupleType p tps
-
--- | Parse an old-style tuple projection of the form @t.(1)@ or @t.(2)@
-mkOldTupleProj :: Term -> Integer -> Parser Term
-mkOldTupleProj t 1 = return $ OldPairLeft t
-mkOldTupleProj t 2 = return $ OldPairRight t
-mkOldTupleProj t _ =
-  do addParseError (pos t) "Old-style projections must be either .(1) or .(2)"
+-- | Parse a tuple projection of the form @t.(1)@ or @t.(2)@
+mkTupleProj :: Term -> Natural -> Parser Term
+mkTupleProj t 1 = return $ PairLeft t
+mkTupleProj t 2 = return $ PairRight t
+mkTupleProj t _ =
+  do addParseError (pos t) "Projections must be either .(1) or .(2)"
      return (badTerm (pos t))
 
 -- | Parse a term as a dotted list of strings
@@ -386,13 +347,13 @@ parseRecursorProj t _ =
   do addParseError (pos t) "Malformed recursor projection"
      return (badTerm (pos t))
 
-parseTupleSelector :: Term -> PosPair Integer -> Parser Term
+parseTupleSelector :: Term -> PosPair Natural -> Parser Term
 parseTupleSelector t i =
   if val i >= 1 then return (mkTupleSelector t (val i)) else
     do addParseError (pos t) "non-positive tuple projection index"
        return (badTerm (pos t))
 
--- | Crete a module name given a list of strings with the top-most
+-- | Create a module name given a list of strings with the top-most
 -- module name given first.
 mkPosModuleName :: [PosPair String] -> PosPair ModuleName
 mkPosModuleName [] = error "internal: Unexpected empty module name"

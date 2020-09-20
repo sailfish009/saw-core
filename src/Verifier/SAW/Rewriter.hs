@@ -46,6 +46,8 @@ module Verifier.SAW.Rewriter
   -- * Term rewriting
   , rewriteSharedTerm
   , rewriteSharedTermTypeSafe
+  -- * Matching
+  , scMatch
   -- * SharedContext
   , rewritingSharedContext
 
@@ -57,25 +59,24 @@ module Verifier.SAW.Rewriter
 import Control.Applicative ((<$>), pure, (<*>))
 import Data.Foldable (Foldable)
 #endif
-import Control.Applicative (Alternative)
 import Control.Monad.Identity
 import Control.Monad.State
 import Control.Monad.Trans.Maybe
 import qualified Data.Foldable as Foldable
-import Data.IORef (IORef)
 import Data.Map (Map)
-import Data.Maybe (fromMaybe)
 import qualified Data.List as List
 import qualified Data.Map as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Control.Monad.Trans.Writer.Strict
+import Numeric.Natural
 
 
 import Verifier.SAW.Cache
 import Verifier.SAW.Conversion
 import qualified Verifier.SAW.Recognizer as R
 import Verifier.SAW.SharedTerm
+import Verifier.SAW.Term.Functor
 import Verifier.SAW.TypedAST
 import qualified Verifier.SAW.TermNet as Net
 
@@ -103,7 +104,7 @@ instance Net.Pattern RewriteRule where
 data MatchState =
   MatchState
   { substitution :: Map DeBruijnIndex Term
-  , constraints :: [(Term, Integer)]
+  , constraints :: [(Term, Natural)]
   }
 
 emptyMatchState :: MatchState
@@ -137,64 +138,127 @@ first_order_match pat term = match pat term Map.empty
 -- occur as the 2nd argument of an @App@ constructor. This ensures
 -- that instantiations are well-typed.
 
--- | Normalization with a set of conversions
-bottom_convs :: [Conversion] -> Term -> TermBuilder Term
-bottom_convs convs t = do
-  t' <-
-    case unwrapTermF t of
-      App t1 t2 -> mkApp (bottom_convs convs t1) (bottom_convs convs t2)
-      _ -> return t
-  fromMaybe (return t') $ msum [ runConversion c t' | c <- convs ]
+asConstantNat :: Term -> Maybe Natural
+asConstantNat t =
+  case R.asCtor t of
+    Just (i, []) | i == "Prelude.Zero" -> Just 0
+    Just (i, [x]) | i == "Prelude.Succ" -> (+ 1) <$> asConstantNat x
+    _ ->
+      do let (f, xs) = R.asApplyAll t
+         i <- R.asGlobalDef f
+         case xs of
+           [x, y]
+             | i == "Prelude.addNat" -> (+) <$> asConstantNat x <*> asConstantNat y
+             | i == "Prelude.mulNat" -> (*) <$> asConstantNat x <*> asConstantNat y
+             | i == "Prelude.expNat" -> (^) <$> asConstantNat x <*> asConstantNat y
+             | i == "Prelude.subNat" ->
+                 do x' <- asConstantNat x
+                    y' <- asConstantNat y
+                    guard (x' >= y')
+                    return (x' - y')
+             | i == "Prelude.divNat" ->
+                 do x' <- asConstantNat x
+                    y' <- asConstantNat y
+                    guard (y' > 0)
+                    return (x' `div` y')
+             | i == "Prelude.remNat" ->
+                 do x' <- asConstantNat x
+                    y' <- asConstantNat y
+                    guard (y' > 0)
+                    return (x' `rem` y')
+           _ -> Nothing
 
--- | An enhanced matcher that can handle some patterns containing lambdas.
-scMatch :: SharedContext -> Term -> Term -> MaybeT IO (Map DeBruijnIndex Term)
-scMatch sc pat term = do
-  MatchState inst cs <- match 0 pat term emptyMatchState
-  mapM_ (check inst) cs
-  return inst
+-- | An enhanced matcher that can handle higher-order patterns.
+scMatch ::
+  SharedContext ->
+  Term {- ^ pattern -} ->
+  Term {- ^ term -} ->
+  IO (Maybe (Map DeBruijnIndex Term))
+scMatch sc pat term =
+  runMaybeT $
+  do --lift $ putStrLn $ "********** scMatch **********"
+     MatchState inst cs <- match 0 [] pat term emptyMatchState
+     mapM_ (check inst) cs
+     return inst
   where
-    check :: Map DeBruijnIndex Term -> (Term, Integer) -> MaybeT IO ()
+    check :: Map DeBruijnIndex Term -> (Term, Natural) -> MaybeT IO ()
     check inst (t, n) = do
       --lift $ putStrLn $ "checking: " ++ show (t, n)
       -- apply substitution to the term
       t' <- lift $ instantiateVarList sc 0 (Map.elems inst) t
       --lift $ putStrLn $ "t': " ++ show t'
       -- constant-fold nat operations
-      t'' <- lift $ runTermBuilder (bottom_convs natConversions t') (scTermF sc)
-      --lift $ putStrLn $ "t'': " ++ show t''
       -- ensure that it evaluates to the same number
-      case unwrapTermF t'' of
-        FTermF (NatLit i) | i == n -> return ()
+      case asConstantNat t' of
+        Just i | i == n -> return ()
         _ -> mzero
 
-    match :: Int -> Term -> Term -> MatchState -> MaybeT IO MatchState
-    match depth x y s@(MatchState m cs) = do
-      --lift $ putStrLn $ "matching (lhs): " ++ show x
-      --lift $ putStrLn $ "matching (rhs): " ++ show y
-      case (unwrapTermF x, unwrapTermF y) of
-        -- check that neither x nor y contains bound variables less than `depth`
-        (LocalVar i, _) | i >= depth &&
-                          (looseVars y `intersectBitSets` (completeBitSet depth)
-                           == emptyBitSet) ->
-          do -- decrement loose variables in y by `depth`
-             y1 <- lift $ instantiateVarList sc 0 (replicate depth (error "scMatch: impossible")) y
-             let (my2, m') = insertLookup (i - depth) y1 m
-             case my2 of
+    asVarPat :: Int -> Term -> Maybe (DeBruijnIndex, [DeBruijnIndex])
+    asVarPat depth = go []
+      where
+        go js x =
+          case unwrapTermF x of
+            LocalVar i
+              | i >= depth -> Just (i, js)
+              | otherwise  -> Nothing
+            App t (unwrapTermF -> LocalVar j)
+              | j < depth -> go (j : js) t
+            _ -> Nothing
+
+    match :: Int -> [(String, Term)] -> Term -> Term -> MatchState -> MaybeT IO MatchState
+    match _ _ (STApp i fv _) (STApp j _ _) s
+      | fv == emptyBitSet && i == j = return s
+    match depth env x y s@(MatchState m cs) =
+      --do
+      --lift $ putStrLn $ "matching (lhs): " ++ scPrettyTerm defaultPPOpts x
+      --lift $ putStrLn $ "matching (rhs): " ++ scPrettyTerm defaultPPOpts y
+      case asVarPat depth x of
+        Just (i, js) ->
+          do -- ensure parameter variables are distinct
+             guard (Set.size (Set.fromList js) == length js)
+             -- ensure y mentions only variables that are in js
+             let fvj = foldl unionBitSets emptyBitSet (map singletonBitSet js)
+             let fvy = looseVars y `intersectBitSets` (completeBitSet depth)
+             guard (fvy `unionBitSets` fvj == fvj)
+             let fixVar t (nm, ty) =
+                   do v <- scFreshGlobal sc nm ty
+                      let Just ec = R.asExtCns v
+                      t' <- instantiateVar sc 0 v t
+                      return (t', ec)
+             let fixVars t [] = return (t, [])
+                 fixVars t (ty : tys) =
+                   do (t', ec) <- fixVar t ty
+                      (t'', ecs) <- fixVars t' tys
+                      return (t'', ec : ecs)
+             -- replace local bound variables with global ones
+             -- this also decrements loose variables in y by `depth`
+             (y1, ecs) <- lift $ fixVars y env
+             -- replace global variables with reindexed bound vars
+             -- y2 should have no more of the newly-created ExtCns vars
+             y2 <- lift $ scAbstractExts sc [ ecs !! j | j <- js ] y1
+             let (my3, m') = insertLookup (i - depth) y2 m
+             case my3 of
                Nothing -> return (MatchState m' cs)
-               Just y2 -> if y == y2 then return (MatchState m' cs) else mzero
-        (App x1 x2, App y1 y2) ->
-          match depth x1 y1 s >>= match depth x2 y2
-        (FTermF xf, FTermF yf) ->
-          case zipWithFlatTermF (match depth) xf yf of
-            Nothing -> mzero
-            Just zf -> Foldable.foldl (>=>) return zf s
-        (Lambda _ t1 x1, Lambda _ t2 x2) ->
-          match depth t1 t2 s >>= match (depth + 1) x1 x2
-        (App _ _, FTermF (NatLit n)) ->
-          -- add deferred constraint
-          return (MatchState m ((x, n) : cs))
-        (_, _) ->
-          if x == y then return s else mzero
+               Just y3 -> if y2 == y3 then return (MatchState m' cs) else mzero
+        Nothing ->
+          case (unwrapTermF x, unwrapTermF y) of
+            -- check that neither x nor y contains bound variables less than `depth`
+            (FTermF xf, FTermF yf) ->
+              case zipWithFlatTermF (match depth env) xf yf of
+                Nothing -> mzero
+                Just zf -> Foldable.foldl (>=>) return zf s
+            (App x1 x2, App y1 y2) ->
+              match depth env x1 y1 s >>= match depth env x2 y2
+            (Lambda _ t1 x1, Lambda nm t2 x2) ->
+              match depth env t1 t2 s >>= match (depth + 1) ((nm, t2) : env) x1 x2
+            (Pi _ t1 x1, Pi nm t2 x2) ->
+              match depth env t1 t2 s >>= match (depth + 1) ((nm, t2) : env) x1 x2
+            (App _ _, FTermF (NatLit n)) ->
+              -- add deferred constraint
+              return (MatchState m ((x, n) : cs))
+            (_, _) ->
+              -- other possible matches are local vars and constants
+              if x == y then return s else mzero
 
 ----------------------------------------------------------------------
 -- Building rewrite rules
@@ -237,6 +301,8 @@ ruleOfTerms l r = RewriteRule { ctxt = [], lhs = l, rhs = r }
 
 -- | Converts a parameterized equality predicate to a RewriteRule.
 ruleOfProp :: Term -> RewriteRule
+ruleOfProp (R.asPi -> Just (_, ty, body)) =
+  let rule = ruleOfProp body in rule { ctxt = ty : ctxt rule }
 ruleOfProp (R.asLambda -> Just (_, ty, body)) =
   let rule = ruleOfProp body in rule { ctxt = ty : ctxt rule }
 ruleOfProp (R.asApplyAll -> (R.isGlobalDef eqIdent' -> Just (), [_, x, y])) =
@@ -249,7 +315,10 @@ ruleOfProp (R.asApplyAll -> (R.isGlobalDef boolEqIdent -> Just (), [x, y])) =
   RewriteRule { ctxt = [], lhs = x, rhs = y }
 ruleOfProp (R.asApplyAll -> (R.isGlobalDef vecEqIdent -> Just (), [_, _, _, x, y])) =
   RewriteRule { ctxt = [], lhs = x, rhs = y }
-ruleOfProp (unwrapTermF -> Constant _ body _) = ruleOfProp body
+ruleOfProp (unwrapTermF -> Constant _ body) = ruleOfProp body
+ruleOfProp (R.asEq -> Just (_, x, y)) =
+  RewriteRule { ctxt = [], lhs = x, rhs = y }
+ruleOfProp (R.asEqTrue -> Just body) = ruleOfProp body
 ruleOfProp t = error $ "ruleOfProp: Predicate not an equation: " ++ scPrettyTerm defaultPPOpts t
 
 -- | Generate a rewrite rule from the type of an identifier, using 'ruleOfTerm'
@@ -288,7 +357,7 @@ scExpandRewriteRule sc (RewriteRule ctxt lhs rhs) =
          -- The type @ti@ is in the de Bruijn context @ctxt1@.
          ti <- scWhnf sc (reverse ctxt !! i)
          -- The datatype parameters are also in context @ctxt1@.
-         (_d, params1, _ixs) <- R.asDataTypeParams ti
+         (_d, params1, _ixs) <- maybe (fail "expected DataTypeApp") return (R.asDataTypeParams ti)
          let ctorRule ctor =
                do -- Compute the argument types @argTs@ in context @ctxt1@.
                   ctorT <- piAppType (ctorType ctor) params1
@@ -330,7 +399,7 @@ scExpandRewriteRule sc (RewriteRule ctxt lhs rhs) =
     piAppType :: Term -> [Term] -> IO Term
     piAppType funtype [] = return funtype
     piAppType funtype (arg : args) =
-      do (_, _, body) <- R.asPi funtype
+      do (_, _, body) <- maybe (fail "expected Pi type") return (R.asPi funtype)
          funtype' <- instantiateVar sc 0 arg body
          piAppType funtype' args
 
@@ -409,30 +478,31 @@ listRules ss = [ r | Left r <- Net.content ss ]
 ----------------------------------------------------------------------
 -- Destructors for terms
 
-asBetaRedex :: (Monad m) => R.Recognizer m Term (String, Term, Term, Term)
+asBetaRedex :: R.Recognizer Term (String, Term, Term, Term)
 asBetaRedex t =
     do (f, arg) <- R.asApp t
        (s, ty, body) <- R.asLambda f
        return (s, ty, body, arg)
 
-asPairRedex :: (Monad m) => R.Recognizer m Term Term
+asPairRedex :: R.Recognizer Term Term
 asPairRedex t =
     do (u, b) <- R.asPairSelector t
        (x, y) <- R.asPairValue u
        return (if b then y else x)
 
-asRecordRedex :: (Monad m) => R.Recognizer m Term (Map FieldName Term, FieldName)
+asRecordRedex :: R.Recognizer Term Term
 asRecordRedex t =
     do (x, i) <- R.asRecordSelector t
        ts <- R.asRecordValue x
-       return (ts, i)
+       case Map.lookup i ts of
+         Just t' -> return t'
+         Nothing -> fail "Record field not found"
 
 -- | An iota redex is a recursor application whose main argument is a
 -- constructor application; specifically, this function recognizes
 --
 -- > RecursorApp d params p_ret cs_fs _ (CtorApp c _ args)
-asIotaRedex :: (Monad m, Alternative m) => R.Recognizer m Term
-               (Ident,[Term],Term,[(Ident,Term)],Ident,[Term])
+asIotaRedex :: R.Recognizer Term (Ident, [Term], Term, [(Ident, Term)], Ident, [Term])
 asIotaRedex t =
   do (d, params, p_ret, cs_fs, _, arg) <- R.asRecursorApp t
      (c, _, args) <- asCtorOrNat arg
@@ -447,7 +517,7 @@ asIotaRedex t =
 reduceSharedTerm :: SharedContext -> Term -> Maybe (IO Term)
 reduceSharedTerm sc (asBetaRedex -> Just (_, _, body, arg)) = Just (instantiateVar sc 0 arg body)
 reduceSharedTerm _ (asPairRedex -> Just t) = Just (return t)
-reduceSharedTerm _ (asRecordRedex -> Just (m, i)) = fmap return (Map.lookup i m)
+reduceSharedTerm _ (asRecordRedex -> Just t) = Just (return t)
 reduceSharedTerm sc (asIotaRedex -> Just (d, params, p_ret, cs_fs, c, args)) =
   Just $ scReduceRecursor sc d params p_ret cs_fs c args
 reduceSharedTerm _ _ = Nothing
@@ -458,24 +528,24 @@ rewriteSharedTerm sc ss t0 =
     do cache <- newCache
        let ?cache = cache in rewriteAll t0
   where
-    rewriteAll :: (?cache :: Cache IORef TermIndex Term) => Term -> IO Term
+    rewriteAll :: (?cache :: Cache IO TermIndex Term) => Term -> IO Term
     rewriteAll (Unshared tf) =
         traverseTF rewriteAll tf >>= scTermF sc >>= rewriteTop
     rewriteAll STApp{ stAppIndex = tidx, stAppTermF = tf } =
         useCache ?cache tidx (traverseTF rewriteAll tf >>= scTermF sc >>= rewriteTop)
     traverseTF :: (a -> IO a) -> TermF a -> IO (TermF a)
-    traverseTF _ tf@(Constant _ _ _) = pure tf
+    traverseTF _ tf@(Constant {}) = pure tf
     traverseTF f tf = traverse f tf
-    rewriteTop :: (?cache :: Cache IORef TermIndex Term) => Term -> IO Term
+    rewriteTop :: (?cache :: Cache IO TermIndex Term) => Term -> IO Term
     rewriteTop t =
         case reduceSharedTerm sc t of
           Nothing -> apply (Net.unify_term ss t) t
           Just io -> rewriteAll =<< io
-    apply :: (?cache :: Cache IORef TermIndex Term) =>
+    apply :: (?cache :: Cache IO TermIndex Term) =>
              [Either RewriteRule Conversion] -> Term -> IO Term
     apply [] t = return t
-    apply (Left (RewriteRule {lhs, rhs}) : rules) t = do
-      result <- runMaybeT (scMatch sc lhs t)
+    apply (Left (RewriteRule {ctxt, lhs, rhs}) : rules) t = do
+      result <- scMatch sc lhs t
       case result of
         Nothing -> apply rules t
         Just inst
@@ -484,6 +554,10 @@ rewriteSharedTerm sc ss t0 =
             -- reflexive rules into simp sets in the first place.
             do putStrLn $ "rewriteSharedTerm: skipping reflexive rule " ++
                           "(THE IMPOSSIBLE HAPPENED!): " ++ scPrettyTerm defaultPPOpts lhs
+               apply rules t
+          | Map.keys inst /= take (length ctxt) [0 ..] ->
+            do putStrLn $ "rewriteSharedTerm: invalid lhs does not contain all variables: "
+                 ++ scPrettyTerm defaultPPOpts lhs
                apply rules t
           | otherwise ->
             do -- putStrLn "REWRITING:"
@@ -503,14 +577,14 @@ rewriteSharedTermTypeSafe sc ss t0 =
     do cache <- newCache
        let ?cache = cache in rewriteAll t0
   where
-    rewriteAll :: (?cache :: Cache IORef TermIndex Term) =>
+    rewriteAll :: (?cache :: Cache IO TermIndex Term) =>
                   Term -> IO Term
     rewriteAll (Unshared tf) =
         rewriteTermF tf >>= scTermF sc >>= rewriteTop
     rewriteAll STApp{ stAppIndex = tidx, stAppTermF = tf } =
         -- putStrLn "Rewriting term:" >> print t >>
         useCache ?cache tidx (rewriteTermF tf >>= scTermF sc >>= rewriteTop)
-    rewriteTermF :: (?cache :: Cache IORef TermIndex Term) =>
+    rewriteTermF :: (?cache :: Cache IO TermIndex Term) =>
                     TermF Term -> IO (TermF Term)
     rewriteTermF tf =
         case tf of
@@ -525,7 +599,7 @@ rewriteSharedTermTypeSafe sc ss t0 =
           Lambda pat t e -> Lambda pat t <$> rewriteAll e
           Constant{}     -> return tf
           _ -> return tf -- traverse rewriteAll tf
-    rewriteFTermF :: (?cache :: Cache IORef TermIndex Term) =>
+    rewriteFTermF :: (?cache :: Cache IO TermIndex Term) =>
                      FlatTermF Term -> IO (FlatTermF Term)
     rewriteFTermF ftf =
         case ftf of
@@ -535,11 +609,6 @@ rewriteSharedTermTypeSafe sc ss t0 =
           PairType{}       -> return ftf -- doesn't matter
           PairLeft{}       -> traverse rewriteAll ftf
           PairRight{}      -> traverse rewriteAll ftf
-          EmptyValue       -> return ftf
-          EmptyType        -> return ftf
-          FieldValue{}     -> traverse rewriteAll ftf
-          FieldType{}      -> return ftf -- doesn't matter
-          RecordSelector{} -> traverse rewriteAll ftf
 
           -- NOTE: we don't rewrite arguments of constructors, datatypes, or
           -- recursors because of dependent types, as we could potentially cause
@@ -557,10 +626,10 @@ rewriteSharedTermTypeSafe sc ss t0 =
           GlobalDef{}      -> return ftf
           StringLit{}      -> return ftf
           ExtCns{}         -> return ftf
-    rewriteTop :: (?cache :: Cache IORef TermIndex Term) =>
+    rewriteTop :: (?cache :: Cache IO TermIndex Term) =>
                   Term -> IO Term
     rewriteTop t = apply (Net.match_term ss t) t
-    apply :: (?cache :: Cache IORef TermIndex Term) =>
+    apply :: (?cache :: Cache IO TermIndex Term) =>
              [Either RewriteRule Conversion] ->
              Term -> IO Term
     apply [] t = return t
@@ -580,7 +649,13 @@ rewritingSharedContext sc ss = sc'
     sc' = sc { scTermF = rewriteTop }
 
     rewriteTop :: TermF Term -> IO Term
-    rewriteTop tf = apply (Net.match_term ss t) t
+    rewriteTop tf =
+      case asPairRedex t of
+        Just t' -> return t'
+        Nothing ->
+          case asRecordRedex t of
+            Just t' -> return t'
+            Nothing -> apply (Net.match_term ss t) t
       where t = Unshared tf
 
     apply :: [Either RewriteRule Conversion] ->
@@ -696,7 +771,7 @@ orderTerms _sc xs = return $ List.sort xs
 
 doHoistIfs :: SharedContext
          -> Simpset
-         -> Cache IORef TermIndex (HoistIfs s)
+         -> Cache IO TermIndex (HoistIfs s)
          -> Term
          -> Term
          -> IO (HoistIfs s)
@@ -725,8 +800,8 @@ doHoistIfs sc ss hoistCache itePat = go
 
        goF :: Term -> TermF Term -> IO (HoistIfs s)
 
-       goF t (LocalVar _)     = return (t, [])
-       goF t (Constant _ _ _) = return (t, [])
+       goF t (LocalVar _)  = return (t, [])
+       goF t (Constant {}) = return (t, [])
 
        goF _ (FTermF ftf) = do
                 (ftf', conds) <- runWriterT $ traverse WriterT $ (fmap go ftf)

@@ -23,7 +23,7 @@ import Verifier.SAW.TypedAST
 import Control.Monad.State.Strict as State
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.List
+import Data.List (elemIndex)
 import qualified Data.Vector as V
 
 --------------------------------------------------------------------------------
@@ -77,7 +77,7 @@ scWriteExternal t0 =
         Lambda s t e   -> unwords ["Lam", s, show t, show e]
         Pi s t e       -> unwords ["Pi", s, show t, show e]
         LocalVar i     -> unwords ["Var", show i]
-        Constant x e t -> unwords ["Constant", x, show e, show t]
+        Constant ec e  -> unwords ["Constant", show (ecVarIndex ec), ecName ec, show (ecType ec), show e]
         FTermF ftf     ->
           case ftf of
             GlobalDef ident     -> unwords ["Global", show ident]
@@ -87,11 +87,6 @@ scWriteExternal t0 =
             PairType x y        -> unwords ["PairT", show x, show y]
             PairLeft e          -> unwords ["ProjL", show e]
             PairRight e         -> unwords ["ProjR", show e]
-            EmptyValue          -> unwords ["Empty"]
-            EmptyType           -> unwords ["EmptyT"]
-            FieldValue f x y    -> unwords ["OldRecord", show f, show x, show y]
-            FieldType f x y     -> unwords ["OldRecordT", show f, show x, show y]
-            RecordSelector e i  -> unwords ["OldRecordSel", show e, show i]
             CtorApp i ps es     ->
               unwords ("Ctor" : show i : map show ps ++ argsep : map show es)
             DataTypeApp i ps es ->
@@ -134,7 +129,7 @@ scReadExternal sc input =
         ["Lam", x, t, e]    -> Lambda x (read t) (read e)
         ["Pi", s, t, e]     -> Pi s (read t) (read e)
         ["Var", i]          -> LocalVar (read i)
-        ["Constant",x,e,t]  -> Constant x (read e) (read t)
+        ["Constant",i,x,t,e]-> Constant (EC (read i) x (read t)) (read e)
         ["Global", x]       -> FTermF (GlobalDef (parseIdent x))
         ["Unit"]            -> FTermF UnitValue
         ["UnitT"]           -> FTermF UnitType
@@ -142,11 +137,6 @@ scReadExternal sc input =
         ["PairT", x, y]     -> FTermF (PairType (read x) (read y))
         ["ProjL", x]        -> FTermF (PairLeft (read x))
         ["ProjR", x]        -> FTermF (PairRight (read x))
-        ["Empty"]           -> FTermF EmptyValue
-        ["EmptyT"]          -> FTermF EmptyType
-        ["OldRecord",f,x,y] -> FTermF (FieldValue (read f) (read x) (read y))
-        ["OldRecordT",f,x,y] -> FTermF (FieldType (read f) (read x) (read y))
-        ["OldRecordSel", e, i] -> FTermF (RecordSelector (read e) (read i))
         ("Ctor" : i : (separateArgs -> Just (ps, es))) ->
           FTermF (CtorApp (parseIdent i) (map read ps) (map read es))
         ("Data" : i : (separateArgs -> Just (ps, es))) ->

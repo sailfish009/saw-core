@@ -3,6 +3,7 @@
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DeriveFoldable #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveLift #-}
 {-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE RankNTypes #-}
@@ -23,7 +24,7 @@ module Verifier.SAW.Term.Functor
     ModuleName, mkModuleName
   , preludeName
     -- * Identifiers
-  , Ident(identModule, identName), mkIdent
+  , Ident(identModule, identBaseName), identName, mkIdent
   , parseIdent
   , isIdent
     -- * Data types and definitions
@@ -41,18 +42,17 @@ module Verifier.SAW.Term.Functor
   , unwrapTermF
   , termToPat
   , alphaEquiv
-  , alistAllFields, recordAListAsTuple, tupleAsRecordAList
+  , alistAllFields
     -- * Sorts
   , Sort, mkSort, propSort, sortOf, maxSort
     -- * Sets of free variables
   , BitSet, emptyBitSet, inBitSet, unionBitSets, intersectBitSets
-  , decrBitSet, completeBitSet
+  , decrBitSet, completeBitSet, singletonBitSet
   , looseVars, smallestFreeVar
   ) where
 
 import Control.Exception (assert)
 import Data.Bits
-import qualified Data.ByteString.UTF8 as BS
 import Data.Char
 #if !MIN_VERSION_base(4,8,0)
 import Data.Foldable (Foldable)
@@ -62,12 +62,18 @@ import Data.Hashable
 import Data.List (intercalate)
 import Data.Map (Map)
 import qualified Data.Map as Map
+import Data.Text (Text)
+import qualified Data.Text as Text
 import Data.Typeable (Typeable)
 import Data.Vector (Vector)
 import qualified Data.Vector as V
 import Data.Word
 import GHC.Generics (Generic)
 import GHC.Exts (IsString(..))
+import Numeric.Natural
+
+import qualified Language.Haskell.TH.Syntax as TH
+import Instances.TH.Lift () -- for instance TH.Lift Text
 
 import qualified Verifier.SAW.TermNet as Net
 import Verifier.SAW.Utils (internalError)
@@ -84,27 +90,19 @@ instance Hashable a => Hashable (Vector a) where
 
 -- Module Names ----------------------------------------------------------------
 
-newtype ModuleName = ModuleName BS.ByteString -- [String]
-  deriving (Eq, Ord, Generic)
+newtype ModuleName = ModuleName Text -- [String]
+  deriving (Eq, Ord, Generic, TH.Lift)
 
 instance Hashable ModuleName -- automatically derived
 
 instance Show ModuleName where
-  show (ModuleName s) = BS.toString s
-
-isModNameChar :: Char -> Bool
-isModNameChar c = isIdChar c || c == '.'
-
-instance Read ModuleName where
-  readsPrec _ s =
-    let (str1, str2) = break (not . isModNameChar) (dropWhile isSpace s) in
-    [(ModuleName (BS.fromString str1), str2)]
+  show (ModuleName s) = Text.unpack s
 
 -- | Create a module name given a list of strings with the top-most
 -- module name given first.
 mkModuleName :: [String] -> ModuleName
 mkModuleName [] = error "internal: mkModuleName given empty module name"
-mkModuleName nms = assert (Foldable.all isCtor nms) $ ModuleName (BS.fromString s)
+mkModuleName nms = assert (Foldable.all isCtor nms) $ ModuleName (Text.pack s)
   where s = intercalate "." (reverse nms)
 
 preludeName :: ModuleName
@@ -116,14 +114,17 @@ preludeName = mkModuleName ["Prelude"]
 data Ident =
   Ident
   { identModule :: ModuleName
-  , identName :: String
+  , identBaseName :: Text
   }
   deriving (Eq, Ord, Generic)
 
 instance Hashable Ident -- automatically derived
 
 instance Show Ident where
-  show (Ident m s) = shows m ('.' : s)
+  show (Ident m s) = shows m ('.' : Text.unpack s)
+
+identName :: Ident -> String
+identName = Text.unpack . identBaseName
 
 instance Read Ident where
   readsPrec _ str =
@@ -131,7 +132,7 @@ instance Read Ident where
     [(parseIdent str1, str2)]
 
 mkIdent :: ModuleName -> String -> Ident
-mkIdent = Ident
+mkIdent m s = Ident m (Text.pack s)
 
 -- | Parse a fully qualified identifier.
 parseIdent :: String -> Ident
@@ -167,9 +168,9 @@ isIdChar c = isAlphaNum c || (c == '_') || (c == '\'')
 -- | The sorts, also known as universes, which can either be a predicative
 -- universe with level i or the impredicative universe Prop.
 data Sort
-  = TypeSort Integer
+  = TypeSort Natural
   | PropSort
-  deriving (Eq, Generic)
+  deriving (Eq, Generic, TH.Lift)
 
 -- Prop is the lowest sort
 instance Ord Sort where
@@ -183,18 +184,9 @@ instance Show Sort where
   showsPrec p (TypeSort i) = showParen (p >= 10) (showString "sort " . shows i)
   showsPrec _ PropSort = showString "Prop"
 
-instance Read Sort where
-  readsPrec p str_in =
-    flip (readParen False) (dropWhile isSpace str_in) $ \str ->
-    if take 5 str == "sort " then
-      map (\(i,str') -> (TypeSort i, str')) (readsPrec p (drop 5 str))
-    else if take 4 str == "Prop" then [(PropSort, drop 4 str)]
-         else []
-
--- | Create sort @Type i@ for the given integer @i@
-mkSort :: Integer -> Sort
-mkSort i | 0 <= i = TypeSort i
-         | otherwise = error "Negative index given to sort."
+-- | Create sort @Type i@ for the given natural number @i@.
+mkSort :: Natural -> Sort
+mkSort i = TypeSort i
 
 -- | Wrapper around 'PropSort', for export
 propSort :: Sort
@@ -252,11 +244,6 @@ data FlatTermF e
   | PairType e e
   | PairLeft e
   | PairRight e
-  | EmptyValue
-  | EmptyType
-  | FieldValue e e e -- Field name, field value, remainder of record
-  | FieldType e e e
-  | RecordSelector e e -- Record value, field name
 
     -- | An inductively-defined type, applied to parameters and type indices
   | DataTypeApp !Ident ![e] ![e]
@@ -291,8 +278,8 @@ data FlatTermF e
   | Sort !Sort
 
     -- Primitive builtin values
-    -- | Natural number with given value (negative numbers are not allowed).
-  | NatLit !Integer
+    -- | Natural number with given value.
+  | NatLit !Natural
     -- | Array value includes type of elements followed by elements.
   | ArrayValue e (Vector e)
     -- | String literal
@@ -319,19 +306,6 @@ alistAllFields (fld:flds) alist
     deleteField f (x:rest) = x : deleteField f rest
 alistAllFields _ _ = Nothing
 
--- | Test if the association list used in a 'RecordType' or 'RecordValue' uses
--- field names that are the strings @"1", "2", ...@ indicating that the record
--- type or value is to be printed as a tuple. If so, return a list of the
--- values, and otherwise return 'Nothing'.
-recordAListAsTuple :: [(String, e)] -> Maybe [e]
-recordAListAsTuple alist =
-  alistAllFields (map show [1 .. length alist]) alist
-
--- | Convert a tuple of expression to an association list used in a 'RecordType'
--- or 'RecordValue' to denote a tuple
-tupleAsRecordAList :: [e] -> [(String, e)]
-tupleAsRecordAList es = zip (map (show :: Integer -> String) [1 ..]) es
-
 -- | Zip a binary function @f@ over a pair of 'FlatTermF's by applying @f@
 -- pointwise to immediate subterms, if the two 'FlatTermF's are the same
 -- constructor; otherwise, return 'Nothing' if they use different constructors
@@ -347,15 +321,6 @@ zipWithFlatTermF f = go
     go (PairType x1 x2) (PairType y1 y2) = Just (PairType (f x1 y1) (f x2 y2))
     go (PairLeft x) (PairLeft y) = Just (PairLeft (f x y))
     go (PairRight x) (PairRight y) = Just (PairLeft (f x y))
-
-    go EmptyValue EmptyValue = Just EmptyValue
-    go EmptyType EmptyType = Just EmptyType
-    go (FieldValue x1 x2 x3) (FieldValue y1 y2 y3) =
-      Just $ FieldValue (f x1 y1) (f x2 y2) (f x3 y3)
-    go (FieldType x1 x2 x3) (FieldType y1 y2 y3) =
-      Just $ FieldType (f x1 y1) (f x2 y2) (f x3 y3)
-    go (RecordSelector x1 x2) (RecordSelector y1 y2) =
-      Just $ RecordSelector (f x1 y1) (f x2 y2)
 
     go (CtorApp cx psx lx) (CtorApp cy psy ly)
       | cx == cy = Just $ CtorApp cx (zipWith f psx psy) (zipWith f lx ly)
@@ -403,8 +368,8 @@ data TermF e
       -- ^ The type of a (possibly) dependent function
     | LocalVar !DeBruijnIndex
       -- ^ Local variables are referenced by deBruijn index.
-    | Constant String !e !e
-      -- ^ An abstract constant packaged with its definition and type.
+    | Constant !(ExtCns e) !e
+      -- ^ An abstract constant packaged with its type and definition.
       -- The body and type should be closed terms.
   deriving (Eq, Ord, Show, Functor, Foldable, Traversable, Generic)
 
@@ -453,7 +418,7 @@ alphaEquiv = term
     termf (Lambda _ t1 u1) (Lambda _ t2 u2) = term t1 t2 && term u1 u2
     termf (Pi _ t1 u1) (Pi _ t2 u2) = term t1 t2 && term u1 u2
     termf (LocalVar i1) (LocalVar i2) = i1 == i2
-    termf (Constant x1 t1 _) (Constant x2 t2 _) = x1 == x2 && term t1 t2
+    termf (Constant x1 _) (Constant x2 _) = ecVarIndex x1 == ecVarIndex x2
     termf _ _ = False
 
     ftermf :: FlatTermF Term -> FlatTermF Term -> Bool
@@ -471,15 +436,15 @@ instance Net.Pattern Term where
 termToPat :: Term -> Net.Pat
 termToPat t =
     case unwrapTermF t of
-      Constant d _ _            -> Net.Atom d
+      Constant ec _             -> Net.Atom (Text.pack (ecName ec))
       App t1 t2                 -> Net.App (termToPat t1) (termToPat t2)
-      FTermF (GlobalDef d)      -> Net.Atom (identName d)
-      FTermF (Sort s)           -> Net.Atom ('*' : show s)
+      FTermF (GlobalDef d)      -> Net.Atom (identBaseName d)
+      FTermF (Sort s)           -> Net.Atom (Text.pack ('*' : show s))
       FTermF (NatLit _)         -> Net.Var --Net.Atom (show n)
       FTermF (DataTypeApp c ps ts) ->
-        foldl Net.App (Net.Atom (identName c)) (map termToPat (ps ++ ts))
+        foldl Net.App (Net.Atom (identBaseName c)) (map termToPat (ps ++ ts))
       FTermF (CtorApp c ps ts)   ->
-        foldl Net.App (Net.Atom (identName c)) (map termToPat (ps ++ ts))
+        foldl Net.App (Net.Atom (identBaseName c)) (map termToPat (ps ++ ts))
       _                         -> Net.Var
 
 unwrapTermF :: Term -> TermF Term
@@ -544,7 +509,7 @@ freesTermF tf =
       Lambda _name tp rhs -> unionBitSets tp (decrBitSet rhs)
       Pi _name lhs rhs -> unionBitSets lhs (decrBitSet rhs)
       LocalVar i -> singletonBitSet i
-      Constant _ _ _ -> emptyBitSet -- assume rhs is a closed term
+      Constant {} -> emptyBitSet -- assume rhs is a closed term
 
 -- | Return a bitset containing indices of all free local variables
 looseVars :: Term -> BitSet

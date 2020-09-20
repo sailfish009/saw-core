@@ -1,4 +1,7 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE DoAndIfThenElse #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE EmptyDataDecls #-}
@@ -37,13 +40,15 @@ import Verifier.SAW.Simulator.RME.Base (RME)
 import qualified Verifier.SAW.Simulator.RME.Base as RME
 import qualified Verifier.SAW.Simulator.RME.Vector as RMEV
 
+import qualified Verifier.SAW.Prim as Prim
 import qualified Verifier.SAW.Simulator as Sim
 import Verifier.SAW.Simulator.Value
 import qualified Verifier.SAW.Simulator.Prims as Prims
 import Verifier.SAW.FiniteValue (FiniteType(..), asFiniteType)
 import qualified Verifier.SAW.Recognizer as R
 import Verifier.SAW.SharedTerm
-import Verifier.SAW.TypedAST (ModuleMap, showTerm)
+import Verifier.SAW.TypedAST (ModuleMap)
+import Verifier.SAW.Utils (panic)
 
 #if !MIN_VERSION_base(4,8,0)
 import Control.Applicative
@@ -57,8 +62,10 @@ evalSharedTerm :: ModuleMap -> Map Ident RValue -> Term -> RValue
 evalSharedTerm m addlPrims t =
   runIdentity $ do
     cfg <- Sim.evalGlobal m (Map.union constMap addlPrims)
-           Sim.noExtCns (const (const Nothing))
+           extcns (const Nothing)
     Sim.evalSharedTerm cfg t
+  where
+    extcns ec = return $ Prim.userError $ "Unimplemented: external constant " ++ ecName ec
 
 ------------------------------------------------------------
 -- Values
@@ -69,6 +76,7 @@ type instance EvalM ReedMuller = Identity
 type instance VBool ReedMuller = RME
 type instance VWord ReedMuller = Vector RME
 type instance VInt  ReedMuller = Integer
+type instance VArray ReedMuller = ()
 type instance Extra ReedMuller = RExtra
 
 type RValue = Value ReedMuller
@@ -157,7 +165,7 @@ prims =
   , Prims.bpXor    = pure2 RME.xor
   , Prims.bpBoolEq = pure2 RME.iff
     -- Bitvector logical
-  , Prims.bpBvNot  = pure1 undefined
+  , Prims.bpBvNot  = pure1 (V.map RME.compl)
   , Prims.bpBvAnd  = pure2 (V.zipWith RME.conj)
   , Prims.bpBvOr   = pure2 (V.zipWith RME.disj)
   , Prims.bpBvXor  = pure2 (V.zipWith RME.xor)
@@ -170,7 +178,7 @@ prims =
   , Prims.bpBvURem = pure2 RMEV.urem
   , Prims.bpBvSDiv = pure2 RMEV.sdiv
   , Prims.bpBvSRem = pure2 RMEV.srem
-  , Prims.bpBvLg2  = undefined--pure1 Prim.bvLg2
+  , Prims.bpBvLg2  = unsupportedRMEPrimitive "bpBvLg2"
     -- Bitvector comparisons
   , Prims.bpBvEq   = pure2 RMEV.eq
   , Prims.bpBvsle  = pure2 RMEV.sle
@@ -190,6 +198,11 @@ prims =
   , Prims.bpBvRor    = pure2 (genShift muxRMEV Prims.vRotateR)
   , Prims.bpBvShl    = pure3 (genShift muxRMEV . Prims.vShiftL)
   , Prims.bpBvShr    = pure3 (genShift muxRMEV . Prims.vShiftR)
+    -- Bitvector misc
+  , Prims.bpBvPopcount = pure1 RMEV.popcount
+  , Prims.bpBvCountLeadingZeros = pure1 RMEV.countLeadingZeros
+  , Prims.bpBvCountTrailingZeros = pure1 RMEV.countTrailingZeros
+  , Prims.bpBvForall = unsupportedRMEPrimitive "bvForall"
     -- Integer operations
   , Prims.bpIntAdd = pure2 (+)
   , Prims.bpIntSub = pure2 (-)
@@ -201,9 +214,17 @@ prims =
   , Prims.bpIntEq  = pure2 (\x y -> RME.constant (x == y))
   , Prims.bpIntLe  = pure2 (\x y -> RME.constant (x <= y))
   , Prims.bpIntLt  = pure2 (\x y -> RME.constant (x < y))
-  , Prims.bpIntMin = undefined--pure2 min
-  , Prims.bpIntMax = undefined--pure2 max
+  , Prims.bpIntMin = pure2 min
+  , Prims.bpIntMax = pure2 max
+    -- Array operations
+  , Prims.bpArrayConstant = unsupportedRMEPrimitive "bpArrayConstant"
+  , Prims.bpArrayLookup = unsupportedRMEPrimitive "bpArrayLookup"
+  , Prims.bpArrayUpdate = unsupportedRMEPrimitive "bpArrayUpdate"
+  , Prims.bpArrayEq = unsupportedRMEPrimitive "bpArrayEq"
   }
+
+unsupportedRMEPrimitive :: String -> a
+unsupportedRMEPrimitive = Prim.unsupportedPrimitive "RME"
 
 constMap :: Map Ident RValue
 constMap =
@@ -218,21 +239,30 @@ constMap =
   , ("Prelude.intToBv" , intToBvOp)
   , ("Prelude.bvToInt" , bvToIntOp)
   , ("Prelude.sbvToInt", sbvToIntOp)
+  -- Integers mod n
+  , ("Prelude.IntMod"    , constFun VIntType)
+  , ("Prelude.toIntMod"  , toIntModOp)
+  , ("Prelude.fromIntMod", constFun (VFun force))
+  , ("Prelude.intModEq"  , intModEqOp)
+  , ("Prelude.intModAdd" , intModBinOp (+))
+  , ("Prelude.intModSub" , intModBinOp (-))
+  , ("Prelude.intModMul" , intModBinOp (*))
+  , ("Prelude.intModNeg" , intModUnOp negate)
   -- Streams
   , ("Prelude.MkStream", mkStreamOp)
   , ("Prelude.streamGet", streamGetOp)
-  , ("Prelude.bvStreamGet", bvStreamGetOp)
-  -- Miscellaneous
-  , ("Prelude.bvToNat", Prims.bvToNatOp)
+
+  -- Misc
+  , ("Prelude.expByNat", Prims.expByNatOp prims)
   ]
 
 -- primitive bvToInt :: (n::Nat) -> bitvector n -> Integer;
 bvToIntOp :: RValue
-bvToIntOp = undefined -- constFun $ wordFun $ VInt . unsigned
+bvToIntOp = unsupportedRMEPrimitive "bvToIntOp"
 
 -- primitive sbvToInt :: (n::Nat) -> bitvector n -> Integer;
 sbvToIntOp :: RValue
-sbvToIntOp = undefined -- constFun $ wordFun $ VInt . signed
+sbvToIntOp = unsupportedRMEPrimitive "sbvToIntOp"
 
 -- primitive intToBv :: (n::Nat) -> Integer -> bitvector n;
 intToBvOp :: RValue
@@ -265,6 +295,34 @@ vSignedShiftR xs i
   | otherwise       = xs
  where x = xs V.! 0
 
+------------------------------------------------------------
+
+toIntModOp :: RValue
+toIntModOp =
+  Prims.natFun $ \n -> return $
+  Prims.intFun "toIntModOp" $ \x -> return $
+  VInt (x `mod` toInteger n)
+
+intModEqOp :: RValue
+intModEqOp =
+  constFun $
+  Prims.intFun "intModEqOp" $ \x -> return $
+  Prims.intFun "intModEqOp" $ \y -> return $
+  VBool (RME.constant (x == y))
+
+intModBinOp :: (Integer -> Integer -> Integer) -> RValue
+intModBinOp f =
+  Prims.natFun $ \n -> return $
+  Prims.intFun "intModBinOp x" $ \x -> return $
+  Prims.intFun "intModBinOp y" $ \y -> return $
+  VInt (f x y `mod` toInteger n)
+
+intModUnOp :: (Integer -> Integer) -> RValue
+intModUnOp f =
+  Prims.natFun $ \n -> return $
+  Prims.intFun "intModUnOp" $ \x -> return $
+  VInt (f x `mod` toInteger n)
+
 ----------------------------------------
 
 -- MkStream :: (a :: sort 0) -> (Nat -> a) -> Stream a;
@@ -279,18 +337,26 @@ streamGetOp :: RValue
 streamGetOp =
   constFun $
   pureFun $ \xs ->
-  Prims.natFun'' "streamGetOp" $ \n -> return $
-  IntTrie.apply (toStream xs) n
+  strictFun $ \case
+    VNat n -> pure $ IntTrie.apply (toStream xs) (toInteger n)
+    VToNat bv ->
+      do let trie = toStream xs
+             loop k [] = IntTrie.apply trie k
+             loop k (b:bs)
+               | Just True <- RME.isBool b
+               = loop k1 bs
+               | Just False <- RME.isBool b
+               = loop k0 bs
+               | otherwise
+               = muxRValue b (loop k1 bs) (loop k0 bs)
+              where
+               k0 = k `shiftL` 1
+               k1 = k0 + 1
+         pure $ loop (0::Integer) (V.toList (toWord bv))
 
--- bvStreamGet :: (a :: sort 0) -> (w :: Nat) -> Stream a -> bitvector w -> a;
-bvStreamGetOp :: RValue
-bvStreamGetOp =
-  constFun $
-  constFun $
-  pureFun $ \_xs ->
-  wordFun $ \_i ->
-  error "bvStreamGetOp"
-  --IntTrie.apply (toStream xs) (Prim.unsigned i)
+    v -> panic "Verifer.SAW.Simulator.RME.streamGetOp"
+               [ "Expected Nat value", show v ]
+
 
 ------------------------------------------------------------
 -- Generating variables for arguments
@@ -316,8 +382,8 @@ bitBlastBasic :: ModuleMap
               -> RValue
 bitBlastBasic m addlPrims t = runIdentity $ do
   cfg <- Sim.evalGlobal m (Map.union constMap addlPrims)
-         (\_varidx name _ty -> error ("RME: unsupported ExtCns: " ++ name))
-         (const (const Nothing))
+         (\ec -> error ("RME: unsupported ExtCns: " ++ ecName ec))
+         (const Nothing)
   Sim.evalSharedTerm cfg t
 
 asPredType :: SharedContext -> Term -> IO [Term]
@@ -326,7 +392,7 @@ asPredType sc t = do
   case t' of
     (R.asPi -> Just (_, t1, t2)) -> (t1 :) <$> asPredType sc t2
     (R.asBoolType -> Just ())    -> return []
-    _                            -> fail $ "Verifier.SAW.Simulator.BitBlast.asPredType: non-boolean result type: " ++ showTerm t'
+    _                            -> panic "Verifier.SAW.Simulator.RME.asPredType" ["non-boolean result type:", showTerm t']
 
 withBitBlastedPred ::
   SharedContext ->
@@ -343,4 +409,4 @@ withBitBlastedPred sc addlPrims t c = do
   let bval' = runIdentity $ applyAll bval vars
   case bval' of
     VBool anf -> c anf shapes
-    _ -> fail "Verifier.SAW.Simulator.RME.bitBlast: non-boolean result type."
+    _ -> panic "Verifier.SAW.Simulator.RME.bitBlast" ["non-boolean result type."]

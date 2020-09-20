@@ -30,16 +30,20 @@ library
     bytestring,
     containers,
     data-inttrie,
+    data-ref,
     directory,
     filepath,
     hashable >= 1.2,
     lens >= 3.8,
     MonadRandom,
     mtl,
+    panic,
+    parameterized-utils,
     pretty,
     random,
-    ref-fd,
     template-haskell,
+    text,
+    th-lift-instances,
     tf-random,
     transformers,
     transformers-compat,
@@ -76,6 +80,7 @@ library
      Verifier.SAW.SharedTerm
      Verifier.SAW.Term.Functor
      Verifier.SAW.Term.CtxTerm
+     Verifier.SAW.OpenTerm
      Verifier.SAW.Term.Pretty
      Verifier.SAW.TermNet
      Verifier.SAW.Testing.Random
@@ -87,7 +92,7 @@ library
   other-modules:
      Verifier.SAW.UnionFind
      Verifier.SAW.Utils
-  GHC-options: -Wall -Werror
+  GHC-options: -Wall -Werror -Wcompat
   if impl(ghc == 8.0.1)
     ghc-options: -Wno-redundant-constraints
   GHC-prof-options: -fprof-auto -fprof-cafs
@@ -99,11 +104,13 @@ library
 
 test-suite test-sawcore
   type: exitcode-stdio-1.0
+  GHC-options: -Wall -Werror -Wcompat
   main-is: Tests.hs
   hs-source-dirs: tests/src
   build-depends:
       base >= 4
     , containers
+    , data-ref
     , hashable
     , lens
     , mtl
@@ -114,12 +121,13 @@ test-suite test-sawcore
     , ansi-wl-pprint
     , QuickCheck >= 2.7
     , tasty
-    , tasty-ant-xml
+    , tasty-ant-xml >= 1.1.0
     , tasty-hunit
     , tasty-quickcheck
     , tagged
 
   other-modules:
+    Tests.CacheTests
     Tests.Parser
     Tests.Rewriter
     Tests.SharedTerm

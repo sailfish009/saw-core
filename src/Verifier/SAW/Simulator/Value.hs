@@ -24,6 +24,7 @@ module Verifier.SAW.Simulator.Value
 import Prelude hiding (mapM)
 
 import Control.Monad (foldM, liftM, mapM)
+import Data.Kind (Type)
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Vector (Vector)
@@ -32,6 +33,7 @@ import qualified Data.Vector as V
 import Verifier.SAW.FiniteValue (FiniteType(..))
 import Verifier.SAW.SharedTerm
 import Verifier.SAW.TypedAST
+import Verifier.SAW.Utils (panic)
 
 import Verifier.SAW.Simulator.MonadLazy
 
@@ -46,8 +48,6 @@ data Value l
   = VFun !(Thunk l -> MValue l)
   | VUnit
   | VPair (Thunk l) (Thunk l) -- TODO: should second component be strict?
-  | VEmpty
-  | VField FieldName (Thunk l) !(Value l)
   | VCtorApp !Ident !(Vector (Thunk l))
   | VVector !(Vector (Thunk l))
   | VVecType (Value l) (Value l)
@@ -58,14 +58,14 @@ data Value l
   | VNat !Integer
   | VInt (VInt l)
   | VIntType
+  | VArray (VArray l)
+  | VArrayType (Value l) (Value l)
   | VString !String
   | VFloat !Float
   | VDouble !Double
   | VPiType !(Value l) !(Thunk l -> MValue l)
   | VUnitType
   | VPairType (Value l) (Value l)
-  | VEmptyType
-  | VFieldType FieldName !(Value l) !(Value l)
   | VDataType !Ident [Value l]
   | VRecordType ![(String, Value l)]
   | VRecordValue ![(String, Thunk l)]
@@ -75,15 +75,17 @@ data Value l
 type Thunk l = Lazy (EvalM l) (Value l)
 
 -- | Evaluation monad for value instantiation 'l'
-type family EvalM l :: * -> *
+type family EvalM l :: Type -> Type
 -- | Booleans for value instantiation 'l'
-type family VBool l :: *
+type family VBool l :: Type
 -- | Words for value instantiation 'l'
-type family VWord l :: *
+type family VWord l :: Type
 -- | Integers for value instantiation 'l'
-type family VInt  l :: *
+type family VInt  l :: Type
+-- | SMT arrays for value instantiation 'l'
+type family VArray l :: Type
 -- | Additional constructors for instantiation 'l'
-type family Extra l :: *
+type family Extra l :: Type
 
 -- | Short-hand for a monadic value.
 type MValue l     = EvalM l (Value l)
@@ -97,6 +99,9 @@ type MWord l      = EvalM l (VWord l)
 -- | Short-hand for a monadic integer.
 type MInt l       = EvalM l (VInt  l)
 
+-- | Short-hand for a monadic array.
+type MArray l     = EvalM l (VArray l)
+
 -- | Short hand to specify that the evaluation monad is a monad (very common)
 type VMonad l     = Monad (EvalM l)
 
@@ -107,11 +112,12 @@ type VMonadLazy l = MonadLazy (EvalM l)
 
 
 -- | Language instantiations with a specific monad.
-data WithM (m :: * -> *) l
+data WithM (m :: Type -> Type) l
 type instance EvalM (WithM m l) = m
 type instance VBool (WithM m l) = VBool l
 type instance VWord (WithM m l) = VWord l
 type instance VInt  (WithM m l) = VInt l
+type instance VArray (WithM m l) = VArray l
 type instance Extra (WithM m l) = Extra l
 
 --------------------------------------------------------------------------------
@@ -131,8 +137,6 @@ instance Show (Extra l) => Show (Value l) where
       VFun {}        -> showString "<<fun>>"
       VUnit          -> showString "()"
       VPair{}        -> showString "<<tuple>>"
-      VEmpty         -> showString "{}"
-      VField f _ _   -> showString "{" . showString f . showString " = _, ...}"
       VCtorApp s xv
         | V.null xv  -> shows s
         | otherwise  -> shows s . showList (toList xv)
@@ -144,6 +148,8 @@ instance Show (Extra l) => Show (Value l) where
       VNat n         -> shows n
       VInt _         -> showString "<<integer>>"
       VIntType       -> showString "Integer"
+      VArray{}       -> showString "<<array>>"
+      VArrayType{}   -> showString "Array"
       VFloat float   -> shows float
       VDouble double -> shows double
       VString s      -> shows s
@@ -151,8 +157,6 @@ instance Show (Extra l) => Show (Value l) where
                         (shows t . showString " -> ...")
       VUnitType      -> showString "#()"
       VPairType x y  -> showParen True (shows x . showString " * " . shows y)
-      VEmptyType {}  -> showString "<<record type>>"
-      VFieldType {}  -> showString "<<record type>>"
       VDataType s vs
         | null vs    -> shows s
         | otherwise  -> shows s . showList vs
@@ -178,53 +182,43 @@ instance Show Nil where
 -- Basic operations on values
 
 vTuple :: VMonad l => [Thunk l] -> Value l
-vTuple xs = VRecordValue $ tupleAsRecordAList xs
+vTuple [] = VUnit
+vTuple [_] = error "vTuple: unsupported 1-tuple"
+vTuple [x, y] = VPair x y
+vTuple (x : xs) = VPair x (ready (vTuple xs))
 
 vTupleType :: VMonad l => [Value l] -> Value l
-vTupleType ts = VRecordType $ tupleAsRecordAList ts
+vTupleType [] = VUnitType
+vTupleType [t] = t
+vTupleType (t : ts) = VPairType t (vTupleType ts)
 
 valPairLeft :: (VMonad l, Show (Extra l)) => Value l -> MValue l
 valPairLeft (VPair t1 _) = force t1
-valPairLeft v = fail $ "valPairLeft: Not a pair value: " ++ show v
+valPairLeft v = panic "Verifier.SAW.Simulator.Value.valPairLeft" ["Not a pair value:", show v]
 
 valPairRight :: (VMonad l, Show (Extra l)) => Value l -> MValue l
 valPairRight (VPair _ t2) = force t2
-valPairRight v = fail $ "valPairRight: Not a pair value: " ++ show v
+valPairRight v = panic "Verifier.SAW.Simulator.Value.valPairRight" ["Not a pair value:", show v]
 
 vRecord :: Map FieldName (Thunk l) -> Value l
 vRecord m = VRecordValue (Map.assocs m)
-
--- | Match on a 'VRecordValue' that represents a tuple, i.e., whose fields are
--- all consecutive numbers
-asVTuple :: Value l -> Maybe [Thunk l]
-asVTuple (VRecordValue elems) = recordAListAsTuple elems
-asVTuple _ = Nothing
-
--- | Match on a 'VRecordType' that represents a tuple type, i.e., whose fields
--- are all consecutive numbers
-asVTupleType :: Value l -> Maybe [Value l]
-asVTupleType (VRecordType elems) = recordAListAsTuple elems
-asVTupleType _ = Nothing
-
-valRecordSelect :: (VMonad l, Show (Extra l)) =>
-  FieldName -> Value l -> MValue l
-valRecordSelect k (VField k' x r) = if k == k' then force x else valRecordSelect k r
-valRecordSelect k VEmpty = fail $ "valRecordSelect: record field not found: " ++ k
-valRecordSelect _ v = fail $ "valRecordSelect: Not a record value: " ++ show v
 
 valRecordProj :: (VMonad l, Show (Extra l)) => Value l -> String -> MValue l
 valRecordProj (VRecordValue fld_map) fld
   | Just t <- lookup fld fld_map = force t
 valRecordProj v@(VRecordValue _) fld =
-  fail $
-  "valRecordProj: record field not found: " ++ fld ++ " in value: " ++ show v
-valRecordProj v _ = fail $ "valRecordProj: not a record value: " ++ show v
+  panic "Verifier.SAW.Simulator.Value.valRecordProj"
+  ["Record field not found:", fld, "in value:", show v]
+valRecordProj v _ =
+  panic "Verifier.SAW.Simulator.Value.valRecordProj"
+  ["Not a record value:", show v]
 
-apply :: VMonad l => Value l -> Thunk l -> MValue l
+apply :: (VMonad l, Show (Extra l)) => Value l -> Thunk l -> MValue l
 apply (VFun f) x = f x
-apply _ _ = fail "Not a function value"
+apply (VPiType _ f) x = f x
+apply v _x = panic "Verifier.SAW.Simulator.Value.apply" ["Not a function value:", show v]
 
-applyAll :: VMonad l => Value l -> [Thunk l] -> MValue l
+applyAll :: (VMonad l, Show (Extra l)) => Value l -> [Thunk l] -> MValue l
 applyAll = foldM apply
 
 asFiniteTypeValue :: Value l -> Maybe FiniteType
@@ -240,14 +234,7 @@ asFiniteTypeValue v =
       t2 <- asFiniteTypeValue v2
       case t2 of
         FTTuple ts -> return (FTTuple (t1 : ts))
-        _ -> Nothing
-    VEmptyType -> return (FTRec Map.empty)
-    VFieldType k v1 v2 -> do
-      t1 <- asFiniteTypeValue v1
-      t2 <- asFiniteTypeValue v2
-      case t2 of
-        FTRec tm -> return (FTRec (Map.insert k t1 tm))
-        _ -> Nothing
+        _ -> return (FTTuple [t1, t2])
     VRecordType elem_tps ->
       FTRec <$> Map.fromList <$>
       mapM (\(fld,tp) -> (fld,) <$> asFiniteTypeValue tp) elem_tps

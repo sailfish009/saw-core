@@ -1,3 +1,5 @@
+{-# LANGUAGE DoAndIfThenElse #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE EmptyDataDecls #-}
@@ -18,8 +20,6 @@ module Verifier.SAW.Simulator.Concrete
        , CExtra(..)
        , toBool
        , toWord
-       , asVTuple
-       , asVTupleType
        , runIdentity
        ) where
 
@@ -52,8 +52,10 @@ evalSharedTerm :: ModuleMap -> Map Ident CValue -> Term -> CValue
 evalSharedTerm m addlPrims t =
   runIdentity $ do
     cfg <- Sim.evalGlobal m (Map.union constMap addlPrims)
-           Sim.noExtCns (const (const Nothing))
+           extcns (const Nothing)
     Sim.evalSharedTerm cfg t
+  where
+    extcns ec = return $ Prim.userError $ "Unimplemented: external constant " ++ ecName ec
 
 ------------------------------------------------------------
 -- Values
@@ -64,6 +66,7 @@ type instance EvalM Concrete = Identity
 type instance VBool Concrete = Bool
 type instance VWord Concrete = BitVector
 type instance VInt  Concrete = Integer
+type instance VArray Concrete = ()
 type instance Extra Concrete = CExtra
 
 type CValue = Value Concrete -- (WithM Identity Concrete)
@@ -205,6 +208,12 @@ prims =
   , Prims.bpBvRor    = pure2 (\x y -> bvRotateR x (unsigned y))
   , Prims.bpBvShl    = pure3 (\b x y -> bvShiftL b x (unsigned y))
   , Prims.bpBvShr    = pure3 (\b x y -> bvShiftR b x (unsigned y))
+    -- Bitvector misc
+  , Prims.bpBvPopcount = pure1 (Prim.bvPopcount undefined)
+  , Prims.bpBvCountLeadingZeros = pure1 (Prim.bvCountLeadingZeros undefined)
+  , Prims.bpBvCountTrailingZeros = pure1 (Prim.bvCountTrailingZeros undefined)
+  , Prims.bpBvForall = unsupportedConcretePrimitive "bvForall"
+
     -- Integer operations
   , Prims.bpIntAdd = pure2 (+)
   , Prims.bpIntSub = pure2 (-)
@@ -218,7 +227,16 @@ prims =
   , Prims.bpIntLt  = pure2 (<)
   , Prims.bpIntMin = pure2 min
   , Prims.bpIntMax = pure2 max
+
+    -- Array operations
+  , Prims.bpArrayConstant = unsupportedConcretePrimitive "bpArrayConstant"
+  , Prims.bpArrayLookup = unsupportedConcretePrimitive "bpArrayLookup"
+  , Prims.bpArrayUpdate = unsupportedConcretePrimitive "bpArrayUpdate"
+  , Prims.bpArrayEq = unsupportedConcretePrimitive "bpArrayEq"
   }
+
+unsupportedConcretePrimitive :: String -> a
+unsupportedConcretePrimitive = Prim.unsupportedPrimitive "concrete"
 
 constMap :: Map Ident CValue
 constMap =
@@ -234,12 +252,21 @@ constMap =
   , ("Prelude.intToBv" , intToBvOp)
   , ("Prelude.bvToInt" , bvToIntOp)
   , ("Prelude.sbvToInt", sbvToIntOp)
+  -- Integers mod n
+  , ("Prelude.IntMod"    , constFun VIntType)
+  , ("Prelude.toIntMod"  , toIntModOp)
+  , ("Prelude.fromIntMod", constFun (VFun force))
+  , ("Prelude.intModEq"  , intModEqOp)
+  , ("Prelude.intModAdd" , intModBinOp (+))
+  , ("Prelude.intModSub" , intModBinOp (-))
+  , ("Prelude.intModMul" , intModBinOp (*))
+  , ("Prelude.intModNeg" , intModUnOp negate)
   -- Streams
   , ("Prelude.MkStream", mkStreamOp)
   , ("Prelude.streamGet", streamGetOp)
-  , ("Prelude.bvStreamGet", bvStreamGetOp)
   -- Miscellaneous
   , ("Prelude.bvToNat", bvToNatOp) -- override Prims.constMap
+  , ("Prelude.expByNat", Prims.expByNatOp prims)
   ]
 
 ------------------------------------------------------------
@@ -288,6 +315,34 @@ bvShiftR c (BV w x) i = Prim.bv w (c' .|. (x `shiftR` j))
 
 ------------------------------------------------------------
 
+toIntModOp :: CValue
+toIntModOp =
+  Prims.natFun $ \n -> return $
+  Prims.intFun "toIntModOp" $ \x -> return $
+  VInt (x `mod` toInteger n)
+
+intModEqOp :: CValue
+intModEqOp =
+  constFun $
+  Prims.intFun "intModEqOp" $ \x -> return $
+  Prims.intFun "intModEqOp" $ \y -> return $
+  VBool (x == y)
+
+intModBinOp :: (Integer -> Integer -> Integer) -> CValue
+intModBinOp f =
+  Prims.natFun $ \n -> return $
+  Prims.intFun "intModBinOp x" $ \x -> return $
+  Prims.intFun "intModBinOp y" $ \y -> return $
+  VInt (f x y `mod` toInteger n)
+
+intModUnOp :: (Integer -> Integer) -> CValue
+intModUnOp f =
+  Prims.natFun $ \n -> return $
+  Prims.intFun "intModUnOp" $ \x -> return $
+  VInt (f x `mod` toInteger n)
+
+------------------------------------------------------------
+
 -- MkStream :: (a :: sort 0) -> (Nat -> a) -> Stream a;
 mkStreamOp :: CValue
 mkStreamOp =
@@ -300,14 +355,8 @@ streamGetOp :: CValue
 streamGetOp =
   constFun $
   pureFun $ \xs ->
-  Prims.natFun'' "streamGetOp" $ \n -> return $
-  IntTrie.apply (toStream xs) n
-
--- bvStreamGet :: (a :: sort 0) -> (w :: Nat) -> Stream a -> bitvector w -> a;
-bvStreamGetOp :: CValue
-bvStreamGetOp =
-  constFun $
-  constFun $
-  pureFun $ \xs ->
-  wordFun $ \i ->
-  IntTrie.apply (toStream xs) (Prim.unsigned i)
+  strictFun $ \case
+    VNat n -> return $ IntTrie.apply (toStream xs) (toInteger n)
+    VToNat w -> return $ IntTrie.apply (toStream xs) (unsigned (toWord w))
+    n -> Prims.panic "Verifier.SAW.Simulator.Concrete.streamGetOp"
+               ["Expected Nat value", show n]

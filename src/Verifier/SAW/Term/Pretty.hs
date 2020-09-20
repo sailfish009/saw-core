@@ -74,6 +74,7 @@ depthAllowed _ _ = True
 data Prec
   = PrecNone   -- ^ Nonterminal 'Term'
   | PrecLambda -- ^ Nonterminal 'LTerm'
+  | PrecProd   -- ^ Nonterminal 'ProductTerm'
   | PrecApp    -- ^ Nonterminal 'AppTerm'
   | PrecArg    -- ^ Nonterminal 'AtomTerm'
 
@@ -88,6 +89,8 @@ precContains _ PrecArg = True
 precContains PrecArg _ = False
 precContains _ PrecApp = True
 precContains PrecApp _ = False
+precContains _ PrecProd = True
+precContains PrecProd _ = False
 precContains _ PrecLambda = True
 precContains PrecLambda _ = False
 precContains PrecNone PrecNone = True
@@ -284,10 +287,10 @@ ppNat (PPOpts{..}) i
 ppMemoVar :: MemoVar -> Doc
 ppMemoVar mv = text "x@" <> integer (toInteger mv)
 
--- | Pretty-print a type constraint (also known as an ascription) @x :: tp@
+-- | Pretty-print a type constraint (also known as an ascription) @x : tp@
 ppTypeConstraint :: Doc -> Doc -> Doc
 ppTypeConstraint x tp =
-  hang 2 $ group (x <<$>> text "::" <+> tp)
+  hang 2 $ group (x <<$>> text ":" <+> tp)
 
 -- | Pretty-print an application to 0 or more arguments at the given precedence
 ppAppList :: Prec -> Doc -> [Doc] -> Doc
@@ -304,14 +307,13 @@ ppLetBlock defs body =
     ppEqn (var,d) = ppMemoVar var <+> char '=' <+> d
 
 
--- | Pretty-print old-style tuples as "(x | y)"
-ppOldTuple :: Doc -> Doc -> Doc
-ppOldTuple x y = parens (x <+> char '|' <+> y)
+-- | Pretty-print pairs as "(x, y)"
+ppPair :: Prec -> Doc -> Doc -> Doc
+ppPair prec x y = ppParensPrec prec PrecNone (group (x <> char ',' <$$> y))
 
--- | Pretty-print old-style tuple types as "#(x | y)"
-ppOldTupleType :: Doc -> Doc -> Doc
-ppOldTupleType x y =
-  char '#' <> parens (x <+> char '|' <+> y)
+-- | Pretty-print pair types as "x * y"
+ppPairType :: Prec -> Doc -> Doc -> Doc
+ppPairType prec x y = ppParensPrec prec PrecProd (x <+> char '*' <+> y)
 
 -- | Pretty-print records (if the flag is 'False') or record types (if the flag
 -- is 'True'), where the latter are preceded by the string @#@, either as:
@@ -321,32 +323,16 @@ ppOldTupleType x y =
 -- * @{ fld1 op val1, ..., fldn op valn }@ otherwise, where @op@ is @::@ for
 --   types and @=@ for values.
 ppRecord :: Bool -> [(String,Doc)] -> Doc
-ppRecord type_p (recordAListAsTuple -> Just ds) =
-  (if type_p then (char '#' <>) else id) $ tupled ds
 ppRecord type_p alist =
   (if type_p then (char '#' <>) else id) $
   encloseSep lbrace rbrace comma $ map ppField alist
   where
     ppField (fld, rhs) = group (nest 2 (text fld <+> text op_str <<$>> rhs))
-    op_str = if type_p then "::" else "="
+    op_str = if type_p then ":" else "="
 
 -- | Pretty-print a projection / selector "x.f"
 ppProj :: String -> Doc -> Doc
 ppProj sel doc = doc <> char '.' <> text sel
-
--- | Pretty-print an old-style record field value
-ppOldFieldValue :: Doc -> Doc -> Doc -> Doc
-ppOldFieldValue f x y =
-  braces (eqn f x <+> char '|' <+> y)
-  where eqn l r = group (nest 2 (l <+> equals <<$>> r))
-
--- | Pretty-print an old-style record field type
-ppOldFieldType :: Doc -> Doc -> Doc -> Doc
-ppOldFieldType f x y = char '#' <> ppOldFieldValue f x y
-
--- | Pretty-print an old-style record selector @x.(f)@
-ppOldRecordSel :: Doc -> Doc -> Doc
-ppOldRecordSel x f = x <> char '.' <> parens f
 
 -- | Pretty-print an array value @[v1, ..., vn]@
 ppArrayValue :: [Doc] -> Doc
@@ -373,14 +359,14 @@ ppDef d tp Nothing = ppTypeConstraint d tp
 ppDef d tp (Just body) = ppTypeConstraint d tp <+> equals <+> body
 
 -- | Pretty-print a datatype declaration of the form
--- > data d (p1::tp1) .. (pN::tpN) :: tp where {
--- >   c1 (x1_1::tp1_1)  .. (x1_N::tp1_N) :: tp1
+-- > data d (p1:tp1) .. (pN:tpN) : tp where {
+-- >   c1 (x1_1:tp1_1)  .. (x1_N:tp1_N) : tp1
 -- >   ...
 -- > }
 ppDataType :: Ident -> (Doc, ((Doc,Doc), [Doc])) -> Doc
 ppDataType d (params, ((d_ctx,d_tp), ctors)) =
   group $ (group
-           ((text "data" <+> ppIdent d <+> params <+> text "::" <+>
+           ((text "data" <+> ppIdent d <+> params <+> text ":" <+>
              (d_ctx <+> text "->" <+> d_tp))
             <<$>> (text "where" <+> lbrace)))
           <<$>>
@@ -398,22 +384,13 @@ ppFlatTermF :: Prec -> FlatTermF Term -> PPM Doc
 ppFlatTermF prec tf =
   case tf of
     GlobalDef i   -> return $ ppIdent i
-    UnitValue     -> return $ text "()"
-    UnitType      -> return $ text "#()"
-    PairValue x y -> ppOldTuple <$> ppTerm' PrecNone x <*> ppTerm' PrecNone y
-    PairType x y  -> ppOldTupleType <$> ppTerm' PrecNone x <*> ppTerm' PrecNone y
+    UnitValue     -> return $ text "(-empty-)"
+    UnitType      -> return $ text "#(-empty-)"
+    PairValue x y -> ppPair prec <$> ppTerm' PrecLambda x <*> ppTerm' PrecNone y
+    PairType x y  -> ppPairType prec <$> ppTerm' PrecApp x <*> ppTerm' PrecProd y
     PairLeft t    -> ppProj "1" <$> ppTerm' PrecArg t
     PairRight t   -> ppProj "2" <$> ppTerm' PrecArg t
-    EmptyValue          -> return $ text "{}"
-    EmptyType           -> return $ text "#{}"
-    FieldValue f x y    ->
-      ppOldFieldValue <$> ppTerm' PrecNone f <*>
-      ppTerm' PrecNone x <*> ppTerm' PrecNone y
-    FieldType f x y     ->
-      ppOldFieldType <$> ppTerm' PrecNone f <*>
-      ppTerm' PrecNone x <*> ppTerm' PrecNone y
-    RecordSelector t f  ->
-      ppOldRecordSel <$> ppTerm' PrecArg t <*> ppTerm' PrecArg f
+
     CtorApp c params args ->
       ppAppList prec (ppIdent c) <$> mapM (ppTerm' PrecArg) (params ++ args)
     DataTypeApp dt params args ->
@@ -437,7 +414,7 @@ ppFlatTermF prec tf =
       ppRecord False <$> mapM (\(fld,t) -> (fld,) <$> ppTerm' PrecNone t) alist
     RecordProj e fld -> ppProj fld <$> ppTerm' PrecArg e
     Sort s -> return $ text (show s)
-    NatLit i -> ppNat <$> (ppOpts <$> ask) <*> return i
+    NatLit i -> ppNat <$> (ppOpts <$> ask) <*> return (toInteger i)
     ArrayValue _ args   ->
       ppArrayValue <$> mapM (ppTerm' PrecNone) (V.toList args)
     StringLit s -> return $ text (show s)
@@ -457,7 +434,7 @@ ppTermF prec (Pi x tp body) =
   (ppPi <$> ppTerm' PrecApp tp <*>
    ppTermInBinder PrecLambda x body)
 ppTermF _ (LocalVar x) = (text <$> varLookupM x) >>= maybeColorM dullgreen
-ppTermF _ (Constant str _ _) = maybeColorM dullblue $ text str
+ppTermF _ (Constant ec _) = maybeColorM dullblue $ text $ ecName ec
 
 
 -- | Internal function to recursively pretty-print a term
@@ -517,8 +494,6 @@ shouldMemoizeTerm t =
     FTermF GlobalDef{} -> False
     FTermF UnitValue -> False
     FTermF UnitType -> False
-    FTermF EmptyValue -> False
-    FTermF EmptyType -> False
     FTermF (CtorApp _ [] []) -> False
     FTermF (DataTypeApp _ [] []) -> False
     FTermF Sort{} -> False

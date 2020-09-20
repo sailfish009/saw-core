@@ -32,6 +32,7 @@ module Verifier.SAW.SCTypeCheck
   , LiftTCM(..)
   , TypedTerm(..)
   , TypeInfer(..)
+  , typeCheckWHNF
   , typeInferCompleteWHNF
   , TypeInferCtx(..)
   , typeInferCompleteInCtx
@@ -45,7 +46,7 @@ import Control.Monad.Except
 import Control.Monad.State.Strict
 import Control.Monad.Reader
 
-import Data.List
+import Data.List ( (\\) )
 import Data.Map (Map)
 import qualified Data.Map as Map
 #if !MIN_VERSION_base(4,8,0)
@@ -371,7 +372,7 @@ instance TypeInfer (TermF TypedTerm) where
          else
          error ("Context = " ++ show ctx)
          -- throwTCError (DanglingVar (i - length ctx))
-  typeInfer (Constant n (TypedTerm _ tp) (TypedTerm req_tp req_tp_sort)) =
+  typeInfer (Constant (EC _ n (TypedTerm req_tp req_tp_sort)) (TypedTerm _ tp)) =
     do void (ensureSort req_tp_sort)
        -- NOTE: we do the subtype check here, rather than call checkSubtype, so
        -- that we can throw the custom BadConstType error on failure
@@ -397,16 +398,6 @@ instance TypeInfer (FlatTermF TypedTerm) where
     do sx <- ensureSort tx
        sy <- ensureSort ty
        liftTCM scSort (max sx sy)
-  typeInfer EmptyValue = liftTCM scEmptyType
-  typeInfer EmptyType = liftTCM scSort (mkSort 0)
-  typeInfer (FieldValue f (TypedTerm _ tx) (TypedTerm _ ty)) =
-    do checkField f
-       liftTCM scFieldType (typedVal f) tx ty
-  typeInfer (FieldType f (TypedTerm _ tx) (TypedTerm _ ty)) =
-    do checkField f
-       sx <- ensureSort tx
-       sy <- ensureSort ty
-       liftTCM scSort (max sx sy)
   typeInfer (PairLeft (TypedTerm _ tp)) =
     case asPairType tp of
       Just (t1, _) -> typeCheckWHNF t1
@@ -415,18 +406,6 @@ instance TypeInfer (FlatTermF TypedTerm) where
     case asPairType tp of
       Just (_, t2) -> typeCheckWHNF t2
       _ -> throwTCError (NotTupleType tp)
-  typeInfer (RecordSelector t@(TypedTerm _ tp) f@(TypedTerm f_trm _)) =
-    do checkField f
-       maybe_str <- asStringLit <$> typeCheckWHNF f_trm
-       f_str <- case maybe_str of
-         Just x -> return x
-         Nothing -> throwTCError (NotStringLit f_trm)
-       case asRecordType tp of
-         Just m ->
-           case Map.lookup f_str m of
-             Nothing -> throwTCError $ BadRecordField f_str tp
-             Just f_tp -> typeCheckWHNF f_tp
-         _ -> throwTCError (NotRecordType t)
 
   typeInfer (DataTypeApp d params args) =
     -- Look up the DataType structure, check the length of the params and args,
@@ -541,12 +520,6 @@ isSubtype t1' t2' = areConvertible t1' t2'
 -- are convertible up to 'natConversions'
 areConvertible :: Term -> Term -> TCM Bool
 areConvertible t1 t2 = liftTCM scConvertibleEval scTypeCheckWHNF True t1 t2
-
--- | Check that a term has type @String@
-checkField :: TypedTerm -> TCM ()
-checkField t =
-  do string_tp <- liftTCM scStringType
-     checkSubtype t string_tp
 
 -- | Infer the type of a recursor application
 inferRecursorApp :: Ident -> [TypedTerm] -> TypedTerm ->
